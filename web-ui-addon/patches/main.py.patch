@@ -1,0 +1,166 @@
+diff --git a/main.py b/main.py
+index 8fa2862..6d93ceb 100644
+--- a/main.py
++++ b/main.py
+@@ -62,7 +62,8 @@ exit_recording = False
+ need_update_line_list = []
+ first_run = True
+ not_record_list = []
+-start_display_time = datetime.datetime.now()
++app_start_time = datetime.datetime.now()
++start_display_time = app_start_time
+ global_proxy = False
+ recording_time_list = {}
+ script_path = os.path.split(os.path.realpath(sys.argv[0]))[0]
+@@ -1733,21 +1734,21 @@ def read_config_value(config_parser: configparser.RawConfigParser, section: str,
+     try:
+ 
+         config_parser.read(config_file, encoding=text_encoding)
+-        if '录制设置' not in config_parser.sections():
+-            config_parser.add_section('录制设置')
+-        if '推送配置' not in config_parser.sections():
+-            config_parser.add_section('推送配置')
+-        if 'Cookie' not in config_parser.sections():
+-            config_parser.add_section('Cookie')
+-        if 'Authorization' not in config_parser.sections():
+-            config_parser.add_section('Authorization')
+-        if '账号密码' not in config_parser.sections():
+-            config_parser.add_section('账号密码')
++        for required_section in ('录制设置', '推送配置', 'Cookie', 'Authorization', '账号密码', 'Web'):
++            if required_section not in config_parser.sections():
++                config_parser.add_section(required_section)
++        if section not in config_parser.sections():
++            config_parser.add_section(section)
+         return config_parser.get(section, option)
+     except (configparser.NoSectionError, configparser.NoOptionError):
+-        config_parser.set(section, option, str(default_value))
+-        with open(config_file, 'w', encoding=text_encoding) as f:
+-            config_parser.write(f)
++        try:
++            from web.service import upsert_ini_option
++
++            upsert_ini_option(config_file, section, option, str(default_value), text_encoding)
++        except Exception:
++            config_parser.set(section, option, str(default_value))
++            with open(config_file, 'w', encoding=text_encoding) as f:
++                config_parser.write(f)
+         return default_value
+ 
+ 
+@@ -1780,6 +1781,97 @@ except URLError:
+ except Exception as err:
+     print("An unexpected error occurred:", err)
+ 
++
++def _parse_web_switch(value: Any, default: bool) -> bool:
++    text = str(value).strip().lower()
++    if text in ('是', 'yes', 'y', 'true', '1', 'on', 'enable', 'enabled'):
++        return True
++    if text in ('否', 'no', 'n', 'false', '0', 'off', 'disable', 'disabled'):
++        return False
++    return default
++
++
++def get_web_runtime_snapshot() -> dict[str, Any]:
++    """返回供 Web 管理界面展示的运行时快照。
++
++    只暴露白名单内的状态字段，绝不包含 Cookie、账号密码、token 等敏感信息。
++    """
++    now_time = datetime.datetime.now()
++    uptime_seconds = max(int((now_time - app_start_time).total_seconds()), 0)
++    hours, remainder = divmod(uptime_seconds, 3600)
++    minutes, seconds = divmod(remainder, 60)
++
++    recording_detail: dict[str, Any] = {}
++    try:
++        for record_name in list(recording or ()):
++            key = str(record_name)
++            time_info = recording_time_list.get(record_name) if recording_time_list else None
++            start_text, quality_text = '', ''
++            if isinstance(time_info, (list, tuple)) and time_info:
++                start_at = time_info[0]
++                quality_text = str(time_info[1]) if len(time_info) > 1 else ''
++                start_text = (start_at.strftime('%Y-%m-%d %H:%M:%S')
++                              if isinstance(start_at, datetime.datetime) else str(start_at))
++            recording_detail[key] = {'start_time': start_text, 'quality': quality_text}
++    except Exception:
++        recording_detail = {}
++
++    try:
++        running_snapshot = [str(item) for item in running_list]
++    except Exception:
++        running_snapshot = []
++
++    return {
++        'version': str(version),
++        'uptime_seconds': uptime_seconds,
++        'uptime_text': '{0}小时{1}分{2}秒'.format(hours, minutes, seconds),
++        'monitoring': monitoring,
++        'recording': recording_detail,
++        'recording_count': len(recording_detail),
++        'recording_time_list': recording_detail,
++        'running_list': running_snapshot,
++        'max_request': globals().get('max_request', 0),
++        'error_count': error_count,
++        'exit_recording': bool(exit_recording),
++    }
++
++
++# --------------------------Web 管理界面-------------------------------------
++web_enabled = _parse_web_switch(
++    os.environ.get('DLR_WEB_ENABLED') or read_config_value(config, 'Web', '是否启用web管理(是/否)', '是'), True
++)
++web_host = str(os.environ.get('DLR_WEB_HOST') or read_config_value(
++    config, 'Web', 'web监听地址', '127.0.0.1')).strip() or '127.0.0.1'
++try:
++    web_port = int(str(os.environ.get('DLR_WEB_PORT') or read_config_value(
++        config, 'Web', 'web服务端口', 8080)).strip())
++except (TypeError, ValueError):
++    web_port = 8080
++web_display_host = '127.0.0.1' if web_host in ('0.0.0.0', '::', '') else web_host
++web_address = f'http://{web_display_host}:{web_port}'
++web_waiting_notified = False
++
++if web_enabled:
++    try:
++        from web.server import start_web_server
++
++        web_server, web_thread = start_web_server(
++            host=web_host,
++            port=web_port,
++            config_file=config_file,
++            url_config_file=url_config_file,
++            backup_dir=backup_dir,
++            log_file=f'{script_path}/logs/streamget.log',
++            file_update_lock=file_update_lock,
++            state_provider=get_web_runtime_snapshot,
++            app_version=version,
++            disk_path=default_path,
++        )
++        print(f'Web 管理界面已启动，请在浏览器中访问 {web_address}')
++    except Exception as web_err:
++        web_enabled = False
++        logger.error(f'Web 管理界面启动失败：{web_err}')
++
+ while True:
+ 
+     try:
+@@ -1793,9 +1885,15 @@ while True:
+                 ini_URL_content = file.read().strip()
+ 
+         if not ini_URL_content.strip():
+-            input_url = input('请输入要录制的主播直播间网址（尽量使用PC网页端的直播间地址）:\n')
+-            with open(url_config_file, 'w', encoding=text_encoding) as file:
+-                file.write(input_url)
++            if web_enabled:
++                if not web_waiting_notified:
++                    print(f'URL_config.ini 暂未添加直播间地址，请访问 {web_address} 在直播间页面中添加')
++                    print('Web 管理已启用，程序将持续等待配置写入，不再阻塞命令行输入')
++                    web_waiting_notified = True
++            else:
++                input_url = input('请输入要录制的主播直播间网址（尽量使用PC网页端的直播间地址）:\n')
++                with open(url_config_file, 'w', encoding=text_encoding) as file:
++                    file.write(input_url)
+     except OSError as err:
+         logger.error(f"发生 I/O 错误: {err}")
+ 
