@@ -261,6 +261,100 @@ class ConfigServiceTestCase(unittest.TestCase):
         self.assertIn("抖音cookie", content)
 
 
+class CookieServiceTestCase(unittest.TestCase):
+    """Cookie 小节的掩码读取与行级写入。"""
+
+    SAMPLE = (
+        "[录制设置]\n"
+        "循环时间(秒) = 120\n"
+        "\n"
+        "[推送配置]\n"
+        "pushplus推送token = SECRET-TOKEN\n"
+        "\n"
+        "[Cookie]\n"
+        "# 录制抖音必填\n"
+        "抖音cookie = ttwid=1%7CB1qls3GdnZhUov9o%7C16805\n"
+        "快手cookie =\n"
+        "b站cookie = SESSION=abc123\n"
+        "\n"
+        "[账号密码]\n"
+        "sooplive账号 = user\n"
+    )
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config_file = os.path.join(self.tmp.name, "config.ini")
+        self.backup_dir = os.path.join(self.tmp.name, "backup")
+        with open(self.config_file, "w", encoding="utf-8") as file_obj:
+            file_obj.write(self.SAMPLE)
+        self.service = service.CookieService(self.config_file, self.backup_dir, threading.Lock())
+
+    def test_list_masks_values_by_default(self) -> None:
+        fields = self.service.list_cookies()
+        keys = [item["key"] for item in fields]
+        self.assertEqual(keys, ["抖音cookie", "快手cookie", "b站cookie"])
+        self.assertEqual(fields[0]["label"], "抖音")
+        self.assertEqual(fields[0]["length"], len("ttwid=1%7CB1qls3GdnZhUov9o%7C16805"))
+        self.assertTrue(fields[0]["has_value"])
+        self.assertFalse(fields[1]["has_value"])
+        for item in fields:
+            self.assertNotIn("value", item)
+        self.assertNotIn("B1qls3GdnZhUov9o", fields[0]["masked"])
+
+    def test_reveal_returns_raw_value(self) -> None:
+        fields = self.service.list_cookies(reveal=True)
+        self.assertEqual(fields[0]["value"], "ttwid=1%7CB1qls3GdnZhUov9o%7C16805")
+
+    def test_update_keeps_percent_encoding(self) -> None:
+        raw = "ttwid=1%7Cnew%7Cvalue; msToken=a%3Db"
+        self.service.update_values({"抖音cookie": raw})
+        with open(self.config_file, "r", encoding="utf-8") as file_obj:
+            content = file_obj.read()
+        self.assertIn("抖音cookie = " + raw, content)
+        self.assertNotIn("%%7C", content)
+        self.assertEqual(self.service.list_cookies(reveal=True)[0]["value"], raw)
+
+    def test_update_preserves_other_sections_and_comments(self) -> None:
+        self.service.update_values({"b站cookie": "NEW=1"})
+        with open(self.config_file, "r", encoding="utf-8") as file_obj:
+            content = file_obj.read()
+        self.assertIn("b站cookie = NEW=1", content)
+        self.assertIn("# 录制抖音必填", content)
+        self.assertIn("pushplus推送token = SECRET-TOKEN", content)
+        self.assertIn("sooplive账号 = user", content)
+        self.assertIn("循环时间(秒) = 120", content)
+        self.assertLess(content.index("[Cookie]"), content.index("[账号密码]"))
+
+    def test_update_creates_backup(self) -> None:
+        self.service.update_values({"快手cookie": "kuaishou=1"})
+        self.assertEqual(len(os.listdir(self.backup_dir)), 1)
+
+    def test_update_rejects_unknown_key(self) -> None:
+        for forbidden in ("pushplus推送token", "sooplive账号", "循环时间(秒)", "不存在cookie"):
+            with self.assertRaises(service.WebServiceError) as ctx:
+                self.service.update_values({forbidden: "x"})
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertEqual(ctx.exception.code, "field_forbidden")
+
+    def test_update_rejects_newline_and_empty_payload(self) -> None:
+        with self.assertRaises(service.WebServiceError) as ctx:
+            self.service.update_values({"快手cookie": "a\nb"})
+        self.assertEqual(ctx.exception.code, "value_invalid")
+        with self.assertRaises(service.WebServiceError):
+            self.service.update_values({})
+        with self.assertRaises(service.WebServiceError):
+            self.service.update_values("not-a-dict")
+
+    def test_mask_secret(self) -> None:
+        self.assertEqual(service.mask_secret(""), "")
+        self.assertEqual(service.mask_secret("abc"), "***")
+        masked = service.mask_secret("ttwid=1%7Cabcdefg")
+        self.assertTrue(masked.startswith("ttwi"))
+        self.assertTrue(masked.endswith("fg"))
+        self.assertIn("*", masked)
+
+
 class LogServiceTestCase(unittest.TestCase):
     """日志读取与脱敏。"""
 
@@ -359,13 +453,14 @@ class WebServerIntegrationTestCase(unittest.TestCase):
         log_file = os.path.join(self.tmp.name, "streamget.log")
         backup_dir = os.path.join(self.tmp.name, "backup")
         with open(config_file, "w", encoding="utf-8") as file_obj:
-            file_obj.write("[录制设置]\n循环时间(秒) = 120\n")
+            file_obj.write("[录制设置]\n循环时间(秒) = 120\n\n[Cookie]\n抖音cookie =\n")
         with open(url_file, "w", encoding="utf-8") as file_obj:
             file_obj.write("")
 
         context = web_server.WebContext(
             service.UrlConfigService(url_file, backup_dir),
             service.ConfigService(config_file, backup_dir),
+            service.CookieService(config_file, backup_dir),
             service.LogService(log_file),
             service.SystemService(app_version="test"),
             state_provider=lambda: {"version": "test", "recording": [], "running_list": []},
@@ -422,6 +517,22 @@ class WebServerIntegrationTestCase(unittest.TestCase):
         payload = json.loads(body.decode("utf-8"))
         self.assertEqual(status, 200)
         self.assertEqual(payload["count"], 1)
+
+    def test_cookie_get_masks_and_put_writes(self) -> None:
+        status, body, _headers = self.request("GET", "/api/cookies")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        for item in payload["data"]["fields"]:
+            self.assertNotIn("value", item)
+
+        status, body, _headers = self.request(
+            "PUT", "/api/cookies", {"values": {"抖音cookie": "ttwid=1%7Cx%7C9"}}
+        )
+        self.assertEqual(status, 200)
+        status, body, _headers = self.request("GET", "/api/cookies?reveal=1")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertTrue(payload["data"]["reveal"])
+        self.assertEqual(payload["data"]["fields"][0]["value"], "ttwid=1%7Cx%7C9")
 
     def test_cross_origin_mutation_is_rejected(self) -> None:
         status, body, _headers = self.request(

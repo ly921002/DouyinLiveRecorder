@@ -24,6 +24,9 @@
       <button class="nav-item" type="button" data-view="settings">
         <span class="nav-icon">设</span><span class="nav-text">录制设置</span>
       </button>
+      <button class="nav-item" type="button" data-view="cookies">
+        <span class="nav-icon">密</span><span class="nav-text">Cookie 设置</span>
+      </button>
       <button class="nav-item" type="button" data-view="logs">
         <span class="nav-icon">志</span><span class="nav-text">运行日志</span>
       </button>
@@ -140,6 +143,36 @@
             <button class="btn btn-ghost" id="resetSettingsBtn" type="button">重新载入</button>
             <button class="btn btn-primary" id="saveSettingsBtn" type="button">保存设置</button>
           </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="cookies">
+        <div class="card">
+          <div class="card-head">
+            <h2>平台 Cookie</h2>
+            <span class="hint">默认只显示掩码，点击“载入明文”后才会显示并可编辑</span>
+          </div>
+          <div class="toolbar">
+            <input class="input" id="cookieSearch" type="search" placeholder="搜索平台名称或配置键" autocomplete="off">
+            <label class="switch">
+              <input type="checkbox" id="cookieOnlyFilled">
+              <span>只看已填写</span>
+            </label>
+            <span class="toolbar-space"></span>
+            <span class="hint" id="cookieMeta">加载中</span>
+            <button class="btn btn-ghost" id="refreshCookiesBtn" type="button">刷新</button>
+            <button class="btn btn-primary" id="revealCookiesBtn" type="button">载入明文</button>
+          </div>
+          <div class="alert" id="cookieAlert" hidden>
+            明文已载入，请勿截图或分享当前页面；修改后点击对应平台的“保存”按钮写回 config.ini。
+          </div>
+          <div class="cookie-list" id="cookieList">
+            <div class="skeleton-line"></div>
+            <div class="skeleton-line"></div>
+            <div class="skeleton-line"></div>
+          </div>
+          <p class="empty" id="cookieEmpty" hidden>没有匹配的平台</p>
+          <p class="hint">写入使用行级定点更新，不会把 Cookie 中的 %7C 之类的编码写成 %%7C，也不会改动其他小节。</p>
         </div>
       </section>
 

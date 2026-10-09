@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from .service import (
     MAX_BODY_BYTES,
     ConfigService,
+    CookieService,
     LogService,
     SystemService,
     UrlConfigService,
@@ -44,6 +45,7 @@ class WebContext:
         self,
         url_service: UrlConfigService,
         config_service: ConfigService,
+        cookie_service: CookieService,
         log_service: LogService,
         system_service: SystemService,
         state_provider: Optional[Callable[[], dict[str, Any]]] = None,
@@ -52,6 +54,7 @@ class WebContext:
     ) -> None:
         self.url_service = url_service
         self.config_service = config_service
+        self.cookie_service = cookie_service
         self.log_service = log_service
         self.system_service = system_service
         self.state_provider = build_state_provider_wrapper(state_provider)
@@ -313,6 +316,27 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 return
             raise WebServiceError("不支持的请求方法", 405, "method_not_allowed")
 
+        if path == "/api/cookies":
+            if method == "GET":
+                reveal = (query.get("reveal") or ["0"])[0]
+                show_raw = str(reveal).strip().lower() in ("1", "true", "yes", "on")
+                fields = context.cookie_service.list_cookies(reveal=show_raw)
+                self._send_json(
+                    200,
+                    {"ok": True, "data": {"section": "Cookie", "reveal": show_raw, "fields": fields}},
+                )
+                return
+            if method == "PUT":
+                payload = self._read_json_body()
+                values = payload.get("values") if isinstance(payload.get("values"), dict) else payload
+                fields = context.cookie_service.update_values(values)
+                self._send_json(
+                    200,
+                    {"ok": True, "data": {"section": "Cookie", "fields": fields}, "message": "Cookie 已保存"},
+                )
+                return
+            raise WebServiceError("不支持的请求方法", 405, "method_not_allowed")
+
         if path == "/api/logs":
             self._require(method, ("GET",))
             raw_limit = (query.get("limit") or ["100"])[0]
@@ -389,6 +413,7 @@ def start_web_server(
     context = WebContext(
         url_service=UrlConfigService(url_config_file, backup_dir, lock),
         config_service=ConfigService(config_file, backup_dir, lock),
+        cookie_service=CookieService(config_file, backup_dir, lock),
         log_service=LogService(log_file),
         system_service=SystemService(app_version=app_version, disk_path=disk_path),
         state_provider=state_provider,

@@ -370,6 +370,41 @@ h2 { font-size: 15px; }
 .field-desc { color: var(--text-muted); font-size: 12px; }
 .field-error { color: var(--danger); font-size: 12px; }
 
+.cookie-list { display: flex; flex-direction: column; gap: 12px; }
+
+.cookie-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--panel-alt);
+}
+
+.cookie-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.cookie-label { font-weight: 600; }
+
+.cookie-input {
+  width: 100%;
+  resize: vertical;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  margin-bottom: 8px;
+}
+
+.cookie-input[readonly] { color: var(--text-muted); }
+
+.alert {
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+
+.alert[hidden] { display: none; }
+
 .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
 .switch input { width: 16px; height: 16px; accent-color: var(--primary); }
 

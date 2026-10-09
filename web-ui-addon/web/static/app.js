@@ -11,6 +11,8 @@
     status: null,
     rooms: [],
     fields: [],
+    cookies: { fields: [], reveal: false },
+    cookieRows: [],
     logs: { lines: [] },
     system: null,
     polling: true,
@@ -46,6 +48,14 @@
     refreshRoomsBtn: document.getElementById("refreshRoomsBtn"),
     addRoomBtn: document.getElementById("addRoomBtn"),
     settingsForm: document.getElementById("settingsForm"),
+    cookieList: document.getElementById("cookieList"),
+    cookieSearch: document.getElementById("cookieSearch"),
+    cookieOnlyFilled: document.getElementById("cookieOnlyFilled"),
+    cookieMeta: document.getElementById("cookieMeta"),
+    cookieEmpty: document.getElementById("cookieEmpty"),
+    cookieAlert: document.getElementById("cookieAlert"),
+    refreshCookiesBtn: document.getElementById("refreshCookiesBtn"),
+    revealCookiesBtn: document.getElementById("revealCookiesBtn"),
     saveSettingsBtn: document.getElementById("saveSettingsBtn"),
     resetSettingsBtn: document.getElementById("resetSettingsBtn"),
     logBox: document.getElementById("logBox"),
@@ -68,6 +78,7 @@
     overview: "总览",
     rooms: "直播间",
     settings: "录制设置",
+    cookies: "Cookie 设置",
     logs: "运行日志",
     system: "系统信息"
   };
@@ -302,6 +313,8 @@
       loadRooms();
     } else if (view === "settings") {
       loadSettings();
+    } else if (view === "cookies") {
+      loadCookies();
     } else if (view === "logs") {
       loadLogs();
     } else if (view === "system") {
@@ -752,6 +765,128 @@
 
   dom.resetSettingsBtn.addEventListener("click", function () {
     loadSettings();
+  });
+
+  /* ---------------------------------------------------------- Cookie 设置 */
+
+  function cookieMatches(item) {
+    var keyword = (dom.cookieSearch.value || "").trim().toLowerCase();
+    if (dom.cookieOnlyFilled.checked && !item.has_value) {
+      return false;
+    }
+    if (!keyword) {
+      return true;
+    }
+    var haystack = ((item.label || "") + " " + (item.key || "")).toLowerCase();
+    return haystack.indexOf(keyword) >= 0;
+  }
+
+  function renderCookies() {
+    clear(dom.cookieList);
+    state.cookieRows = [];
+    var fields = (state.cookies.fields || []).filter(cookieMatches);
+    var revealed = !!state.cookies.reveal;
+
+    dom.cookieAlert.hidden = !revealed;
+    dom.revealCookiesBtn.textContent = revealed ? "隐藏明文" : "载入明文";
+    var total = (state.cookies.fields || []).length;
+    var filled = (state.cookies.fields || []).filter(function (item) {
+      return item.has_value;
+    }).length;
+    dom.cookieMeta.textContent = "共 " + total + " 个平台，已填写 " + filled + " 个" + (revealed ? "（明文已载入）" : "");
+
+    if (!fields.length) {
+      dom.cookieEmpty.hidden = false;
+      return;
+    }
+    dom.cookieEmpty.hidden = true;
+
+    fields.forEach(function (item) {
+      var row = el("div", "cookie-item");
+
+      var head = el("div", "cookie-head");
+      head.appendChild(el("span", "cookie-label", item.label || item.key));
+      head.appendChild(el("span", "badge badge-platform", item.key));
+      head.appendChild(el("span", "badge" + (item.has_value ? " badge-monitoring" : ""),
+        item.has_value ? "已填写 " + item.length + " 字符" : "未填写"));
+      row.appendChild(head);
+
+      var area = el("textarea", "input cookie-input");
+      area.rows = 3;
+      area.readOnly = !revealed;
+      area.value = revealed ? (item.value || "") : (item.masked || "");
+      area.placeholder = revealed ? "粘贴浏览器里复制的完整 Cookie" : "点击右上角“载入明文”后可编辑";
+      row.appendChild(area);
+
+      var ops = el("div", "ops");
+
+      var saveBtn = el("button", "btn btn-primary", "保存");
+      saveBtn.type = "button";
+      saveBtn.disabled = !revealed;
+      saveBtn.addEventListener("click", function () {
+        saveCookie(item.key, area.value, revealed);
+      });
+
+      var clearBtn = el("button", "btn btn-ghost", "清空");
+      clearBtn.type = "button";
+      clearBtn.disabled = !revealed || !item.has_value;
+      clearBtn.addEventListener("click", function () {
+        showConfirm(
+          "清空 Cookie",
+          "确定清空“" + (item.label || item.key) + "”的 Cookie 吗？该操作会写入 config.ini。",
+          function () {
+            return saveCookie(item.key, "", revealed);
+          },
+          "清空",
+          true
+        );
+      });
+
+      ops.appendChild(saveBtn);
+      ops.appendChild(clearBtn);
+      row.appendChild(ops);
+      dom.cookieList.appendChild(row);
+      state.cookieRows.push(row);
+    });
+  }
+
+  function saveCookie(key, value, revealed) {
+    var payload = { values: {} };
+    payload.values[key] = value;
+    return api("/api/cookies", { method: "PUT", body: payload }).then(function (result) {
+      toast(result.message || "Cookie 已保存", "success");
+      return loadCookies(revealed);
+    });
+  }
+
+  function loadCookies(reveal) {
+    var url = "/api/cookies" + (reveal ? "?reveal=1" : "");
+    return api(url).then(function (payload) {
+      state.cookies = payload.data || { fields: [] };
+      renderCookies();
+    }).catch(function (error) {
+      toast(error.userMessage || "Cookie 列表加载失败", "error");
+    });
+  }
+
+  dom.cookieSearch.addEventListener("input", renderCookies);
+  dom.cookieOnlyFilled.addEventListener("change", renderCookies);
+  dom.refreshCookiesBtn.addEventListener("click", function () {
+    loadCookies(!!state.cookies.reveal);
+  });
+  dom.revealCookiesBtn.addEventListener("click", function () {
+    if (state.cookies.reveal) {
+      loadCookies(false);
+      return;
+    }
+    showConfirm(
+      "载入明文 Cookie",
+      "明文会显示在当前页面，请勿截图或共享屏幕。确认载入？",
+      function () {
+        return loadCookies(true);
+      },
+      "载入明文"
+    );
   });
 
   /* ---------------------------------------------------------- 运行日志 */

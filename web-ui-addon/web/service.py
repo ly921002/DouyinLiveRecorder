@@ -62,6 +62,7 @@ PLATFORM_HOST_SUFFIXES: tuple[tuple[str, str], ...] = (
 )
 
 CONFIG_SECTION = "录制设置"
+COOKIE_SECTION = "Cookie"
 
 TRUE_VALUES = ("是", "yes", "true", "1", "on", "y", "t")
 FALSE_VALUES = ("否", "no", "false", "0", "off", "n", "f")
@@ -162,6 +163,44 @@ def backup_file(file_path: str, backup_dir: str, limit_counts: int = MAX_BACKUP_
     except OSError:
         # 备份失败不应阻断主流程
         pass
+
+
+def apply_ini_option(lines: list[str], section: str, option: str, value: str) -> list[str]:
+    """在行列表中定点更新指定小节的 option，缺失时插入到该小节末尾。"""
+    target_section = section.strip()
+    new_line = "{0} = {1}".format(option, value)
+
+    section_index = -1
+    section_end = len(lines)
+    for index, line in enumerate(lines):
+        matched = _SECTION_PATTERN.match(line)
+        if not matched:
+            continue
+        if matched.group("name").strip() == target_section:
+            section_index = index
+            for inner in range(index + 1, len(lines)):
+                if _SECTION_PATTERN.match(lines[inner]):
+                    section_end = inner
+                    break
+            break
+
+    if section_index >= 0:
+        for index in range(section_index + 1, section_end):
+            matched = _OPTION_PATTERN.match(lines[index])
+            if matched and matched.group("option").strip() == option:
+                lines[index] = new_line
+                return lines
+        insert_at = section_end
+        while insert_at - 1 > section_index and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, new_line)
+        return lines
+
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.append("[{0}]".format(target_section))
+    lines.append(new_line)
+    return lines
 
 
 def upsert_ini_option(
@@ -742,40 +781,196 @@ class ConfigService:
     @staticmethod
     def _apply(lines: list[str], option: str, value: str) -> list[str]:
         """在行列表中定点更新 option，缺失时插入到所属小节末尾。"""
-        target_section = CONFIG_SECTION
-        new_line = "{0} = {1}".format(option, value)
+        return apply_ini_option(lines, CONFIG_SECTION, option, value)
 
-        section_index = -1
-        section_end = len(lines)
-        for index, line in enumerate(lines):
+
+# ---------------------------------------------------------------- Cookie 服务
+
+COOKIE_LABELS: dict[str, str] = {
+    "抖音cookie": "抖音",
+    "快手cookie": "快手",
+    "tiktok_cookie": "TikTok",
+    "虎牙cookie": "虎牙",
+    "斗鱼cookie": "斗鱼",
+    "yy_cookie": "YY",
+    "b站cookie": "B站",
+    "B站cookie": "B站",
+    "小红书cookie": "小红书",
+    "bigo_cookie": "Bigo",
+    "blued_cookie": "Blued",
+    "sooplive_cookie": "SOOP",
+    "netease_cookie": "网易CC",
+    "千度热播_cookie": "千度热播",
+    "pandatv_cookie": "PandaTV",
+    "猫耳fm_cookie": "猫耳FM",
+    "winktv_cookie": "WinkTV",
+    "flextv_cookie": "FlexTV",
+    "look_cookie": "Look",
+    "twitcasting_cookie": "TwitCasting",
+    "baidu_cookie": "百度",
+    "weibo_cookie": "微博",
+    "kugou_cookie": "酷狗",
+    "twitch_cookie": "Twitch",
+    "liveme_cookie": "LiveMe",
+    "huajiao_cookie": "花椒",
+    "liuxing_cookie": "流星",
+    "showroom_cookie": "ShowRoom",
+    "acfun_cookie": "AcFun",
+    "changliao_cookie": "畅聊",
+    "yinbo_cookie": "音播",
+    "yingke_cookie": "映客",
+    "zhihu_cookie": "知乎",
+    "chzzk_cookie": "CHZZK",
+    "haixiu_cookie": "嗨秀",
+    "vvxqiu_cookie": "VV星球",
+    "17live_cookie": "17Live",
+    "langlive_cookie": "浪Live",
+    "pplive_cookie": "漂漂",
+    "6room_cookie": "六间房",
+    "lehaitv_cookie": "乐嗨",
+    "huamao_cookie": "花猫",
+    "shopee_cookie": "Shopee",
+    "youtube_cookie": "YouTube",
+    "taobao_cookie": "淘宝",
+    "jd_cookie": "京东",
+    "faceit_cookie": "Faceit",
+    "migu_cookie": "咪咕",
+    "lianjie_cookie": "连接",
+    "laixiu_cookie": "来秀",
+    "picarto_cookie": "Picarto",
+}
+
+
+def mask_secret(value: str) -> str:
+    """对敏感值做掩码预览，只保留首尾少量字符。"""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "*" * len(text)
+    return "{0}{1}{2}".format(text[:4], "*" * 8, text[-2:])
+
+
+def cookie_label(key: str) -> str:
+    """把配置键转换为平台显示名。"""
+    if key in COOKIE_LABELS:
+        return COOKIE_LABELS[key]
+    name = re.sub(r"(?i)_?cookie$", "", key).strip(" _-")
+    if not name:
+        return key
+    if name.isascii():
+        return name.upper() if len(name) <= 5 else name.capitalize()
+    return name
+
+
+class CookieService:
+    """config.ini 中 [Cookie] 小节的读写服务。
+
+    - 默认只返回掩码预览，明文需要显式请求
+    - 写入使用行级定点更新，绝不做 % → %% 转义，避免破坏 Cookie 中的百分号编码
+    """
+
+    MAX_VALUE_LENGTH = 8000
+
+    def __init__(
+        self,
+        config_file: str,
+        backup_dir: str,
+        lock: Optional[threading.Lock] = None,
+        encoding: Optional[str] = None,
+    ) -> None:
+        self.config_file = config_file
+        self.backup_dir = backup_dir
+        self._lock: threading.Lock = lock if lock is not None else threading.RLock()
+        self._encoding = encoding
+
+    # ---------------- 读取
+
+    def _raw_pairs_unlocked(self) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        if not os.path.isfile(self.config_file):
+            return pairs
+        lines, _newline, _encoding = read_text_lines(self.config_file, self._encoding)
+        current_section = ""
+        for line in lines:
             section = _SECTION_PATTERN.match(line)
-            if not section:
+            if section:
+                current_section = section.group("name").strip()
                 continue
-            if section.group("name").strip() == target_section:
-                section_index = index
-                for inner in range(index + 1, len(lines)):
-                    if _SECTION_PATTERN.match(lines[inner]):
-                        section_end = inner
-                        break
-                break
+            if current_section != COOKIE_SECTION:
+                continue
+            if _COMMENT_PATTERN.match(line):
+                continue
+            matched = _OPTION_PATTERN.match(line)
+            if not matched:
+                continue
+            pairs.append((matched.group("option").strip(), matched.group("value").strip()))
+        return pairs
 
-        if section_index >= 0:
-            for index in range(section_index + 1, section_end):
-                matched = _OPTION_PATTERN.match(lines[index])
-                if matched and matched.group("option").strip() == option:
-                    lines[index] = new_line
-                    return lines
-            insert_at = section_end
-            while insert_at - 1 > section_index and not lines[insert_at - 1].strip():
-                insert_at -= 1
-            lines.insert(insert_at, new_line)
-            return lines
+    def _list_unlocked(self, reveal: bool = False) -> list[dict[str, Any]]:
+        fields: list[dict[str, Any]] = []
+        for key, value in self._raw_pairs_unlocked():
+            item: dict[str, Any] = {
+                "key": key,
+                "label": cookie_label(key),
+                "masked": mask_secret(value),
+                "length": len(value),
+                "has_value": bool(value),
+            }
+            if reveal:
+                item["value"] = value
+            fields.append(item)
+        return fields
 
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append("[{0}]".format(target_section))
-        lines.append(new_line)
-        return lines
+    def list_cookies(self, reveal: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._list_unlocked(reveal)
+
+    # ---------------- 写入
+
+    def update_values(self, values: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(values, dict):
+            raise WebServiceError("请求体必须是 JSON 对象", 400, "payload_invalid")
+        if not values:
+            raise WebServiceError("没有需要保存的 Cookie 项", 400, "payload_empty")
+
+        with self._lock:
+            known = {key for key, _value in self._raw_pairs_unlocked()}
+            unknown = [key for key in values if key not in known]
+            if unknown:
+                raise WebServiceError(
+                    "以下键不属于 Cookie 小节，不能通过此接口修改：{0}".format("、".join(sorted(map(str, unknown)))),
+                    400,
+                    "field_forbidden",
+                )
+
+            cleaned: dict[str, str] = {}
+            for key, value in values.items():
+                if value is None:
+                    text = ""
+                else:
+                    text = str(value).strip()
+                if "\n" in text or "\r" in text:
+                    raise WebServiceError(
+                        "Cookie“{0}”不能包含换行符".format(cookie_label(str(key))), 400, "value_invalid"
+                    )
+                if len(text) > self.MAX_VALUE_LENGTH:
+                    raise WebServiceError(
+                        "Cookie“{0}”内容过长，上限 {1} 个字符".format(cookie_label(str(key)), self.MAX_VALUE_LENGTH),
+                        400,
+                        "value_too_long",
+                    )
+                cleaned[str(key)] = text
+
+            lines, newline, encoding = read_text_lines(self.config_file, self._encoding)
+            for key, value in cleaned.items():
+                lines = apply_ini_option(lines, COOKIE_SECTION, key, value)
+            backup_file(self.config_file, self.backup_dir)
+            text = newline.join(lines)
+            if lines:
+                text += newline
+            atomic_write_text(self.config_file, text, encoding)
+            return self._list_unlocked()
 
 
 # ---------------------------------------------------------------- 日志服务
