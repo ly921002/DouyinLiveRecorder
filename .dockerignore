@@ -1,6 +1,25 @@
-.github/workflows/build-image.yml
 .git
+.github
 .gitignore
 .dockerignore
-README.md
 LICENSE
+.idea
+.vscode
+**/pycache
+**/*.py[cod]
+*.egg-info
+.venv
+venv
+env
+.env
+*.log
+logs
+downloads
+backup_config
+*.mp4
+*.flv
+*.ts
+
+pyproject.toml 声明了 readme = "README.md"，uv sync 需要它；
+排除规则写在前面，这里显式重新放行（.dockerignore 后出现的规则优先）
+!README.md
