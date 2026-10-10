@@ -2,53 +2,159 @@ name: Build and Push Docker Image
 
 on:
   push:
-    tags:
-      - '*'
+    branches: [main, master]
+    tags: ['*']
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name for the Docker image'
+        description: 'Docker image tag (e.g. v4.0.7)'
         required: false
         default: 'latest'
+      platforms:
+        description: 'Target platforms'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+      push_image:
+        description: 'Push image to registries'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  IMAGE_NAME: douyin-live-recorder
 
 jobs:
-  build_and_push:
+  build:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write # 推送到 ghcr.io 需要
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: Set up QEMU
+      # 计算本次构建的：镜像名列表 / 目标平台 / 是否推送
+      - name: Prepare build parameters
+        id: prep
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          INPUT_PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          INPUT_PUSH_IMAGE: ${{ github.event.inputs.push_image }}
+        run: |
+          set -eu
+          owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+
+          # GHCR 用内置 GITHUB_TOKEN，无需任何额外配置
+          images="ghcr.io/${owner_lc}/${IMAGE_NAME}"
+
+          has_dockerhub=false
+          # Docker Hub 仅在配置了 DOCKERHUB_USERNAME 时才加入
+          if [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            has_dockerhub=true
+            images="$(printf '%s\ndocker.io/%s/%s' "${images}" "${DOCKERHUB_USERNAME}" "${IMAGE_NAME}")"
+          fi
+
+          {
+            echo "images<<EOF"
+            echo "${images}"
+            echo "EOF"
+            echo "has_dockerhub=${has_dockerhub}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            # PR 只做构建验证：单平台 + load 到本地，速度快且可冒烟测试
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=${INPUT_PLATFORMS}" >> "$GITHUB_OUTPUT"
+            if [ "${INPUT_PUSH_IMAGE:-}" = "false" ]; then
+              echo "should_push=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_push=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Set up QEMU (multi-arch)
+        if: steps.prep.outputs.platforms != 'linux/amd64'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Cache Docker layers
-        uses: actions/cache@v3
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
+          images: ${{ steps.prep.outputs.images }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ github.event.inputs.tag_name }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || github.event_name == 'workflow_dispatch' }}
+            type=sha,format=short
+
+      - name: Log in to GitHub Container Registry
+        if: steps.prep.outputs.should_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+        if: steps.prep.outputs.should_push == 'true' && steps.prep.outputs.has_dockerhub == 'true'
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
           registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          push: true
-          tags: |
-            ihmily/douyin-live-recorder:${{ github.event.inputs.tag_name || github.ref_name }} 
-            ihmily/douyin-live-recorder:latest
-          platforms: linux/amd64,linux/arm64
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
+          platforms: ${{ steps.prep.outputs.platforms }}
+          push: ${{ steps.prep.outputs.should_push == 'true' }}
+          load: ${{ steps.prep.outputs.should_push == 'false' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          # gha 缓存支持多平台；type=local 在多平台下会 solve 失败，不要改用 local
+          # 非推送场景（load 到本地）不导出缓存，避免与 docker exporter 冲突
+          cache-from: type=gha
+          cache-to: ${{ steps.prep.outputs.should_push == 'true' && 'type=gha,mode=max' || '' }}
+
+      # 仅在非推送场景（PR / 手动关闭推送）执行，验证镜像真的可用
+      - name: Smoke test
+        if: steps.prep.outputs.should_push == 'false'
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          set -eu
+          echo "== image: $IMAGE"
+          docker run --rm --entrypoint sh "$IMAGE" -c \
+            'command -v proxychains4 && command -v uv && command -v ffmpeg && command -v node && test -s /etc/proxychains.conf && echo "binaries OK"'
+          docker run --rm --entrypoint python "$IMAGE" -c "import requests, httpx, execjs, loguru, Crypto; print('python deps OK')"
+          docker run --rm --entrypoint uv "$IMAGE" run python -c "import sys; print('uv run ->', sys.version.split()[0])"
+          docker run --rm --entrypoint node "$IMAGE" --version
+          docker run --rm --entrypoint ffmpeg "$IMAGE" -version | head -1
+          docker run --rm "$IMAGE" ls -l /app/config/config.ini
+          # 校验 proxychains 配置能被加载（ProxyList 链首若不是数字 IP，proxychains4 会 exit 1）
+          docker run --rm "$IMAGE" proxychains4 echo "proxychains config loaded"
+          docker run --rm "$IMAGE" proxychains4 uv run python -c "print('proxychains4 + uv run OK')"
+
+      - name: Image summary
+        if: always()
+        run: |
+          echo "### Docker build result" >> "$GITHUB_STEP_SUMMARY"
+          echo "- platforms: ${{ steps.prep.outputs.platforms }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- pushed: ${{ steps.prep.outputs.should_push }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
