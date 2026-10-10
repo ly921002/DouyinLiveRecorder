@@ -83,7 +83,12 @@ COPY proxychains.conf /etc/proxychains.conf
 #    uv 用于运行：proxychains4 uv run python main.py
 #    这里预先 sync 出 /app/.venv，容器启动时就不必再联网装依赖
 # ---------------------------------------------------------------------------
-COPY pyproject.toml requirements.txt README.md /app/
+COPY pyproject.toml requirements.txt /app/
+
+# pyproject.toml 里声明了 readme = "README.md"，uv sync 读取项目元数据时该文件必须存在。
+# 这里放一个占位文件，避免 .dockerignore 排除 README.md 时 COPY 直接失败；
+# 真正的 README.md 会在后面 `COPY . /app` 时覆盖它。
+RUN touch /app/README.md
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir uv \
