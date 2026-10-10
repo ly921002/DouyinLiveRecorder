@@ -111,6 +111,13 @@ ENV UV_NO_SYNC=1
 # 预建数据目录，避免挂载前目录属主异常
 RUN mkdir -p /app/logs /app/downloads /app/backup_config
 
+# Web 管理界面（web-ui-addon 补丁提供，默认 8080）
+# 监听地址/端口可用 DLR_WEB_HOST / DLR_WEB_PORT 覆盖，写在 config.ini 的 [Web] 段亦可
+ENV DLR_WEB_ENABLED=true \
+    DLR_WEB_HOST=0.0.0.0 \
+    DLR_WEB_PORT=8080
+EXPOSE 8080
+
 VOLUME ["/app/config", "/app/logs", "/app/downloads", "/app/backup_config"]
 
 CMD ["proxychains4", "uv", "run", "python", "main.py"]

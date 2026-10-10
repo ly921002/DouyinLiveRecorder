@@ -1,23 +1,41 @@
 services:
   app:
-    image: ihmily/douyin-live-recorder:latest
+    # 用自己 Action 构建的镜像（含 proxychains4 / uv / node / ffmpeg / web 管理界面）。
+    # 上游官方镜像 ihmily/douyin-live-recorder 没有这些组件，不能直接用。
+    image: ghcr.io/ly921002/douyin-live-recorder:latest
+    # 若要在本机从源码构建，取消下一行注释并注释掉上面的 image
+    # build: .
     environment:
       - TERM=xterm-256color
       - UV_NO_SYNC=1
-      # 若 uv 自身需要联网（如重新解析依赖），可在这里补上 HTTP 代理；
+      # Web 管理界面。容器内必须监听 0.0.0.0，否则宿主机映射不到
+      - DLR_WEB_ENABLED=true
+      - DLR_WEB_HOST=0.0.0.0
+      - DLR_WEB_PORT=8080
+      # 若 uv 自身需要联网（如重新解析依赖），在这里补 HTTP 代理；
       # uv 是静态二进制，proxychains 的 LD_PRELOAD 对它无效
       # - HTTPS_PROXY=http://172.17.0.1:7890
       # - HTTP_PROXY=http://172.17.0.1:7890
     extra_hosts:
-      # 保留映射，容器内也能用 host.docker.internal 指代宿主机
+      # 容器内可用 host.docker.internal 指代宿主机
       - "host.docker.internal:host-gateway"
     tty: true
     stdin_open: true
-    #build: .
+    ports:
+      # Web 界面没有任何登录鉴权，默认只映射到宿主机回环地址：
+      # 需先在宿主机用 ssh -L 8080:127.0.0.1:8080 user@host 建隧道再访问。
+      # 确认网络可信、要放开局域网/公网时，把下面一行换成 "0.0.0.0:8080:8080"
+      # （务必自行加反向代理鉴权或防火墙白名单）
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
       - ./backup_config:/app/backup_config
       - ./downloads:/app/downloads
-      - ./proxychains.conf:/etc/proxychains.conf:ro
+      # 需要覆盖代理配置时才启用这一行。
+      # 注意：宿主机上的 ./proxychains.conf 必须是「已存在的文件」，
+      # 不能是目录——Compose 会为不存在的挂载源自动创建目录，
+      # 结果就是 not a directory: Are you trying to mount a directory onto a file。
+      # 镜像内已有默认配置（socks5 172.17.0.1:10808），不挂载也能启动。
+      # - ./proxychains.conf:/etc/proxychains.conf:ro
     restart: always
