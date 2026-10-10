@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DouyinLiveRecorder 管理界面</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="主导航">
+    <div class="sidebar-head">
+      <span class="logo-mark">DLR</span>
+      <span class="logo-text">录制管理</span>
+    </div>
+    <nav class="nav" id="nav">
+      <button class="nav-item is-active" type="button" data-view="overview">
+        <span class="nav-icon">总</span><span class="nav-text">总览</span>
+      </button>
+      <button class="nav-item" type="button" data-view="rooms">
+        <span class="nav-icon">房</span><span class="nav-text">直播间</span>
+      </button>
+      <button class="nav-item" type="button" data-view="settings">
+        <span class="nav-icon">设</span><span class="nav-text">录制设置</span>
+      </button>
+      <button class="nav-item" type="button" data-view="cookies">
+        <span class="nav-icon">密</span><span class="nav-text">Cookie 设置</span>
+      </button>
+      <button class="nav-item" type="button" data-view="logs">
+        <span class="nav-icon">志</span><span class="nav-text">运行日志</span>
+      </button>
+      <button class="nav-item" type="button" data-view="system">
+        <span class="nav-icon">系</span><span class="nav-text">系统信息</span>
+      </button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="version" id="sideVersion">版本加载中</div>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim" hidden></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="drawerBtn" type="button" title="打开菜单">菜单</button>
+      <button class="icon-btn" id="collapseBtn" type="button" title="折叠侧边栏">折叠</button>
+      <div class="topbar-title">
+        <h1 id="viewTitle">总览</h1>
+        <span class="topbar-sub" id="viewSub">加载中</span>
+      </div>
+      <div class="topbar-right">
+        <span class="live-dot" id="liveDot" title="轮询状态"></span>
+        <span class="topbar-meta" id="pollMeta">每 5 秒刷新</span>
+        <button class="icon-btn" id="themeBtn" type="button" title="切换主题">暗色</button>
+      </div>
+    </header>
+
+    <main class="content" id="content">
+
+      <section class="view is-active" data-view="overview">
+        <div class="stat-grid" id="statGrid">
+          <div class="card stat-card skeleton-card"></div>
+          <div class="card stat-card skeleton-card"></div>
+          <div class="card stat-card skeleton-card"></div>
+          <div class="card stat-card skeleton-card"></div>
+        </div>
+
+        <div class="board">
+          <div class="card board-col">
+            <div class="card-head">
+              <h2>录制中</h2>
+              <span class="badge badge-recording" id="countRecording">0</span>
+            </div>
+            <div class="board-body" id="listRecording"><div class="skeleton-line"></div></div>
+          </div>
+          <div class="card board-col">
+            <div class="card-head">
+              <h2>监测中</h2>
+              <span class="badge badge-monitoring" id="countMonitoring">0</span>
+            </div>
+            <div class="board-body" id="listMonitoring"><div class="skeleton-line"></div></div>
+          </div>
+          <div class="card board-col">
+            <div class="card-head">
+              <h2>已禁用</h2>
+              <span class="badge badge-disabled" id="countDisabled">0</span>
+            </div>
+            <div class="board-body" id="listDisabled"><div class="skeleton-line"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="rooms">
+        <div class="card">
+          <div class="toolbar">
+            <input class="input" id="roomSearch" type="search" placeholder="搜索主播名或直播间地址" autocomplete="off">
+            <select class="select" id="roomFilter">
+              <option value="all">全部状态</option>
+              <option value="recording">录制中</option>
+              <option value="monitoring">监测中</option>
+              <option value="idle">待监测</option>
+              <option value="disabled">已禁用</option>
+            </select>
+            <span class="toolbar-space"></span>
+            <button class="btn btn-ghost" id="refreshRoomsBtn" type="button">刷新</button>
+            <button class="btn btn-primary" id="addRoomBtn" type="button">添加直播间</button>
+          </div>
+
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th class="col-id">行号</th>
+                  <th class="col-name">主播</th>
+                  <th class="col-url">直播间地址</th>
+                  <th class="col-quality">画质</th>
+                  <th class="col-status">状态</th>
+                  <th class="col-ops">操作</th>
+                </tr>
+              </thead>
+              <tbody id="roomRows">
+                <tr><td colspan="6"><div class="skeleton-line"></div></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="empty" id="roomEmpty" hidden>没有匹配的直播间</p>
+        </div>
+      </section>
+
+      <section class="view" data-view="settings">
+        <div class="card">
+          <div class="card-head">
+            <h2>录制设置</h2>
+            <span class="hint">仅展示安全白名单字段，保存后下一轮循环生效</span>
+          </div>
+          <div class="form-grid" id="settingsForm">
+            <div class="skeleton-line"></div>
+            <div class="skeleton-line"></div>
+            <div class="skeleton-line"></div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-ghost" id="resetSettingsBtn" type="button">重新载入</button>
+            <button class="btn btn-primary" id="saveSettingsBtn" type="button">保存设置</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="cookies">
+        <div class="card">
+          <div class="card-head">
+            <h2>平台 Cookie</h2>
+            <span class="hint">默认只显示掩码，点击“载入明文”后才会显示并可编辑</span>
+          </div>
+          <div class="toolbar">
+            <input class="input" id="cookieSearch" type="search" placeholder="搜索平台名称或配置键" autocomplete="off">
+            <label class="switch">
+              <input type="checkbox" id="cookieOnlyFilled">
+              <span>只看已填写</span>
+            </label>
+            <span class="toolbar-space"></span>
+            <span class="hint" id="cookieMeta">加载中</span>
+            <button class="btn btn-ghost" id="refreshCookiesBtn" type="button">刷新</button>
+            <button class="btn btn-primary" id="revealCookiesBtn" type="button">载入明文</button>
+          </div>
+          <div class="alert" id="cookieAlert" hidden>
+            明文已载入，请勿截图或分享当前页面；修改后点击对应平台的“保存”按钮写回 config.ini。
+          </div>
+          <div class="cookie-list" id="cookieList">
+            <div class="skeleton-line"></div>
+            <div class="skeleton-line"></div>
+            <div class="skeleton-line"></div>
+          </div>
+          <p class="empty" id="cookieEmpty" hidden>没有匹配的平台</p>
+          <p class="hint">写入使用行级定点更新，不会把 Cookie 中的 %7C 之类的编码写成 %%7C，也不会改动其他小节。</p>
+        </div>
+      </section>
+
+      <section class="view" data-view="logs">
+        <div class="card">
+          <div class="toolbar">
+            <label class="switch">
+              <input type="checkbox" id="logAuto">
+              <span>自动刷新</span>
+            </label>
+            <select class="select" id="logLimit">
+              <option value="50">50 行</option>
+              <option value="100" selected>100 行</option>
+              <option value="200">200 行</option>
+              <option value="300">300 行</option>
+            </select>
+            <span class="toolbar-space"></span>
+            <span class="hint" id="logMeta">就绪</span>
+            <button class="btn btn-ghost" id="refreshLogsBtn" type="button">刷新</button>
+          </div>
+          <div class="log-box" id="logBox"><div class="skeleton-line"></div></div>
+          <p class="hint">日志已自动脱敏，地址参数与凭据字段会被替换</p>
+        </div>
+      </section>
+
+      <section class="view" data-view="system">
+        <div class="stat-grid" id="systemGrid">
+          <div class="card stat-card skeleton-card"></div>
+          <div class="card stat-card skeleton-card"></div>
+          <div class="card stat-card skeleton-card"></div>
+          <div class="card stat-card skeleton-card"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>运行详情</h2></div>
+          <dl class="detail-list" id="systemDetail"><div class="skeleton-line"></div></dl>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <h2 id="modalTitle">标题</h2>
+      <button class="icon-btn" id="modalCloseBtn" type="button" title="关闭">关闭</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="modalCancelBtn" type="button">取消</button>
+      <button class="btn btn-primary" id="modalOkBtn" type="button">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
