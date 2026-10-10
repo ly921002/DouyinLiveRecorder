@@ -162,6 +162,7 @@ jobs:
           docker run --rm --entrypoint python "$IMAGE" -c "import requests, httpx, execjs, loguru, Crypto; print('python deps OK')"
           docker run --rm --entrypoint uv "$IMAGE" run python -c "import sys; print('uv run ->', sys.version.split()[0])"
           docker run --rm --entrypoint node "$IMAGE" --version
+          docker run --rm --entrypoint uv "$IMAGE" run python -c "from web.server import start_web_server; print('web ui module OK')"
           docker run --rm --entrypoint ffmpeg "$IMAGE" -version | head -1
           docker run --rm "$IMAGE" ls -l /app/config/config.ini
           # 校验 proxychains 配置能被加载（ProxyList 链首若不是数字 IP，proxychains4 会 exit 1）

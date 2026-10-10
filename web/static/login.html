@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · DouyinLiveRecorder 管理界面</title>
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+<main class="login-wrap">
+  <form class="login-card" id="loginForm" method="post" action="/login">
+    <div class="login-head">
+      <span class="login-mark">DLR</span>
+      <h1>录制管理</h1>
+      <p class="login-sub">请输入用户名与口令后进入管理界面</p>
+    </div>
+
+    <label class="field">
+      <span class="field-label">用户名</span>
+      <input class="input" id="username" name="username" type="text" autocomplete="username" spellcheck="false" required autofocus>
+    </label>
+
+    <label class="field">
+      <span class="field-label">口令</span>
+      <input class="input" id="password" name="password" type="password" autocomplete="current-password" required>
+    </label>
+
+    <p class="login-error" id="loginError" role="alert" hidden></p>
+
+    <button class="btn btn-primary btn-block" id="submitBtn" type="submit">登 录</button>
+
+    <p class="login-hint">凭据来自环境变量 DLR_WEB_USER / DLR_WEB_PASSWORD，或 config.ini 的 [Web] 段</p>
+  </form>
+</main>
+<script src="/login.js"></script>
+</body>
+</html>

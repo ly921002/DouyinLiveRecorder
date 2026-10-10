@@ -31,6 +31,7 @@
     liveDot: document.getElementById("liveDot"),
     pollMeta: document.getElementById("pollMeta"),
     themeBtn: document.getElementById("themeBtn"),
+    logoutBtn: document.getElementById("logoutBtn"),
     collapseBtn: document.getElementById("collapseBtn"),
     drawerBtn: document.getElementById("drawerBtn"),
     sideVersion: document.getElementById("sideVersion"),
@@ -274,6 +275,14 @@
     var current = document.documentElement.getAttribute("data-theme");
     applyTheme(current === "dark" ? "light" : "dark");
   });
+
+  if (dom.logoutBtn) {
+    dom.logoutBtn.addEventListener("click", function () {
+      fetch("/api/logout", { method: "POST" })
+        .catch(function () { /* 忽略网络错误，仍然跳转登录页 */ })
+        .then(function () { window.location.replace("/login"); });
+    });
+  }
 
   dom.collapseBtn.addEventListener("click", function () {
     var collapsed = dom.app.classList.toggle("is-collapsed");

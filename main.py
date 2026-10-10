@@ -1847,6 +1847,11 @@ try:
         config, 'Web', 'web服务端口', 8080)).strip())
 except (TypeError, ValueError):
     web_port = 8080
+# 登录鉴权：环境变量优先，其次 config.ini 的 [Web] 段。未配置口令则不启用鉴权
+web_user = str(os.environ.get('DLR_WEB_USER') or read_config_value(
+    config, 'Web', 'web登录用户名', 'admin')).strip() or 'admin'
+web_password = str(os.environ.get('DLR_WEB_PASSWORD') or read_config_value(
+    config, 'Web', 'web登录密码', '')).strip()
 web_display_host = '127.0.0.1' if web_host in ('0.0.0.0', '::', '') else web_host
 web_address = f'http://{web_display_host}:{web_port}'
 web_waiting_notified = False
@@ -1866,6 +1871,8 @@ if web_enabled:
             state_provider=get_web_runtime_snapshot,
             app_version=version,
             disk_path=default_path,
+            auth_user=web_user,
+            auth_password=web_password,
         )
         print(f'Web 管理界面已启动，请在浏览器中访问 {web_address}')
     except Exception as web_err:

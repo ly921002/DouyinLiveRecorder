@@ -12,6 +12,9 @@ services:
       - DLR_WEB_ENABLED=true
       - DLR_WEB_HOST=0.0.0.0
       - DLR_WEB_PORT=8080
+      # 登录鉴权。⚠️ 部署前务必把 DLR_WEB_PASSWORD 改成强口令
+      - DLR_WEB_USER=admin
+      - DLR_WEB_PASSWORD=change-me
       # 若 uv 自身需要联网（如重新解析依赖），在这里补 HTTP 代理；
       # uv 是静态二进制，proxychains 的 LD_PRELOAD 对它无效
       # - HTTPS_PROXY=http://172.17.0.1:7890
@@ -22,10 +25,9 @@ services:
     tty: true
     stdin_open: true
     ports:
-      # Web 界面没有任何登录鉴权，默认只映射到宿主机回环地址：
-      # 需先在宿主机用 ssh -L 8080:127.0.0.1:8080 user@host 建隧道再访问。
-      # 确认网络可信、要放开局域网/公网时，把下面一行换成 "0.0.0.0:8080:8080"
-      # （务必自行加反向代理鉴权或防火墙白名单）
+      # 界面已带登录鉴权，但默认仍只映射到宿主机回环地址，多一层网络隔离。
+      # 需要在其他机器访问时：ssh -L 8080:127.0.0.1:8080 user@host 后访问 http://127.0.0.1:8080
+      # 确认要放开局域网/公网时改成 "0.0.0.0:8080:8080"（务必已改成强口令，并建议加反向代理 HTTPS）
       - "127.0.0.1:8080:8080"
     volumes:
       - ./config:/app/config

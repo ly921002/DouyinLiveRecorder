@@ -7,9 +7,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -32,10 +36,109 @@ STATIC_FILES: dict[str, tuple[str, str]] = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/login": ("login.html", "text/html; charset=utf-8"),
+    "/login.html": ("login.html", "text/html; charset=utf-8"),
+    "/login.css": ("login.css", "text/css; charset=utf-8"),
+    "/login.js": ("login.js", "application/javascript; charset=utf-8"),
 }
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
 WILDCARD_HOSTS = ("0.0.0.0", "::", "")
+
+# ---------------------------------------------------------------- 登录鉴权
+SESSION_COOKIE = "dlr_session"
+SESSION_TTL_SECONDS = 12 * 3600
+LOGIN_MAX_FAILS = 5
+LOGIN_FAIL_WINDOW_SECONDS = 300
+# 这些路径在鉴权之前放行（登录页与其静态资源）
+PUBLIC_PATHS = ("/login", "/login.html", "/login.css", "/login.js")
+
+
+class LoginGuard:
+    """按来源 IP 限制登录失败次数，缓解暴力破解。
+
+    只以 TCP 对端地址计数，不信任 X-Forwarded-For（该头可伪造，会被绕过）。
+    放在反向代理后面时同一代理的所有请求共用一个计数。
+    """
+
+    def __init__(self, max_fails: int = LOGIN_MAX_FAILS, window: int = LOGIN_FAIL_WINDOW_SECONDS) -> None:
+        self._max_fails = max_fails
+        self._window = window
+        self._records: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, key: str) -> list[float]:
+        now = time.time()
+        items = [moment for moment in self._records.get(key, []) if now - moment < self._window]
+        if items:
+            self._records[key] = items
+        else:
+            self._records.pop(key, None)
+        return items
+
+    def locked_seconds(self, key: str) -> int:
+        with self._lock:
+            items = self._prune(key)
+            if len(items) < self._max_fails:
+                return 0
+            return max(int(self._window - (time.time() - items[-self._max_fails])), 1)
+
+    def record_fail(self, key: str) -> None:
+        with self._lock:
+            self._prune(key)
+            self._records.setdefault(key, []).append(time.time())
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._records.pop(key, None)
+
+
+class AuthStore:
+    """用户名/口令校验 + HMAC 签名的会话令牌。
+
+    签名密钥每进程随机生成，因此重启后已发出的会话全部失效。
+    未配置口令时 enabled 为 False，服务保持无鉴权（并打印告警）。
+    """
+
+    def __init__(self, username: str = "", password: str = "") -> None:
+        self.username = (username or "admin").strip() or "admin"
+        self._password = password or ""
+        self.enabled = bool(self._password)
+        self._secret = secrets.token_bytes(32)
+        self._guard = LoginGuard()
+
+    def locked_seconds(self, key: str) -> int:
+        return self._guard.locked_seconds(key)
+
+    def verify(self, username: str, password: str, key: str) -> tuple[bool, str, int]:
+        """返回 (是否通过, 提示, HTTP 状态码)。"""
+        if not self.enabled:
+            return True, "", 200
+        if self._guard.locked_seconds(key) > 0:
+            return False, "登录尝试过于频繁，请稍后再试", 429
+        if hmac.compare_digest(username or "", self.username) and hmac.compare_digest(password or "", self._password):
+            self._guard.reset(key)
+            return True, "", 200
+        self._guard.record_fail(key)
+        return False, "用户名或密码不正确", 401
+
+    def issue_token(self) -> str:
+        expire_at = str(int(time.time()) + SESSION_TTL_SECONDS)
+        return "{0}.{1}".format(expire_at, self._sign(expire_at))
+
+    def valid_token(self, token: str) -> bool:
+        if not token or "." not in token:
+            return False
+        expire_at, _, signature = token.partition(".")
+        if not hmac.compare_digest(signature, self._sign(expire_at)):
+            return False
+        try:
+            return int(expire_at) > time.time()
+        except (TypeError, ValueError):
+            return False
+
+    def _sign(self, payload: str) -> str:
+        return hmac.new(self._secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 class WebContext:
@@ -51,6 +154,7 @@ class WebContext:
         state_provider: Optional[Callable[[], dict[str, Any]]] = None,
         bind_host: str = "127.0.0.1",
         bind_port: int = 8080,
+        auth: Optional[AuthStore] = None,
     ) -> None:
         self.url_service = url_service
         self.config_service = config_service
@@ -60,6 +164,7 @@ class WebContext:
         self.state_provider = build_state_provider_wrapper(state_provider)
         self.bind_host = bind_host
         self.bind_port = bind_port
+        self.auth = auth if auth is not None else AuthStore()
 
 
 class WebAdminServer(ThreadingHTTPServer):
@@ -115,7 +220,12 @@ class WebAdminHandler(BaseHTTPRequestHandler):
     def log_error(self, fmt: str, *args: Any) -> None:
         """静默默认错误日志。"""
 
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def _send_json(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        extra_headers: Optional[list[tuple[str, str]]] = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -124,6 +234,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        for name, value in extra_headers or ():
+            self.send_header(name, value)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -228,6 +340,12 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             path = parts.path.rstrip("/") or "/"
             query = parse_qs(parts.query or "")
 
+            if path in PUBLIC_PATHS:
+                self._dispatch_public(method, path)
+                return
+            if not self._check_authenticated(path):
+                return
+
             if path.startswith("/api/"):
                 self._dispatch_api(method, path, query)
                 return
@@ -238,6 +356,93 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             self._send_error(error)
         except Exception as error:  # noqa: BLE001 - 兜底，避免线程因异常退出
             self._send_json(500, {"ok": False, "error": "服务器内部错误：{0}".format(error), "code": "internal_error"})
+
+    # ------------------------------------------------------------ 登录鉴权
+
+    def _client_ip(self) -> str:
+        try:
+            return str(self.client_address[0])
+        except (AttributeError, IndexError, TypeError):
+            return "unknown"
+
+    def _session_token(self) -> str:
+        for item in (self.headers.get("Cookie") or "").split(";"):
+            name, sep, value = item.partition("=")
+            if sep and name.strip() == SESSION_COOKIE:
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _session_cookie(token: str, max_age: int = SESSION_TTL_SECONDS) -> str:
+        # 不设 Secure：管理界面通常经 SSH 隧道以 http 访问，加了会导致 Cookie 无法写入
+        return "{0}={1}; Path=/; HttpOnly; SameSite=Strict; Max-Age={2}".format(
+            SESSION_COOKIE, token, max_age
+        )
+
+    def _check_authenticated(self, path: str) -> bool:
+        context: Optional[WebContext] = getattr(self.server, "context", None)  # type: ignore[assignment]
+        auth = getattr(context, "auth", None)
+        if auth is None or not auth.enabled or auth.valid_token(self._session_token()):
+            return True
+        if path.startswith("/api/"):
+            self._send_json(
+                401,
+                {"ok": False, "error": "未登录或登录已过期，请重新登录", "code": "unauthorized"},
+            )
+        else:
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        return False
+
+    def _dispatch_public(self, method: str, path: str) -> None:
+        """登录页与其静态资源，以及 POST /login 登录提交。"""
+        if path not in PUBLIC_PATHS:
+            raise WebServiceError("请求的资源不存在", 404, "not_found")
+        if method == "POST":
+            self._handle_login()
+            return
+        if method not in ("GET", "HEAD"):
+            raise WebServiceError("不支持的请求方法", 405, "method_not_allowed")
+        self._dispatch_static(path)
+
+    def _handle_login(self) -> None:
+        context: WebContext = self.server.context  # type: ignore[assignment]
+        if context is None:
+            raise WebServiceError("Web 服务尚未初始化", 503, "not_ready")
+        auth = context.auth
+        client_ip = self._client_ip()
+
+        if not auth.enabled:
+            self._send_json(200, {"ok": True, "message": "未启用登录鉴权", "redirect": "/"})
+            return
+
+        locked = auth.locked_seconds(client_ip)
+        if locked > 0:
+            self._send_json(
+                429,
+                {
+                    "ok": False,
+                    "error": "登录尝试过于频繁，请 {0} 秒后重试".format(locked),
+                    "code": "too_many_attempts",
+                },
+            )
+            return
+
+        payload = self._read_json_body()
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        passed, message, status = auth.verify(username, password, client_ip)
+        if not passed:
+            self._send_json(status, {"ok": False, "error": message, "code": "login_failed"})
+            return
+        self._send_json(
+            200,
+            {"ok": True, "message": "登录成功", "redirect": "/"},
+            [("Set-Cookie", self._session_cookie(auth.issue_token()))],
+        )
 
     def _dispatch_static(self, path: str) -> None:
         matched = STATIC_FILES.get(path)
@@ -352,6 +557,15 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "data": context.system_service.info()})
             return
 
+        if path == "/api/logout":
+            self._require(method, ("POST",))
+            self._send_json(
+                200,
+                {"ok": True, "message": "已退出登录", "redirect": "/login"},
+                [("Set-Cookie", self._session_cookie("", 0))],
+            )
+            return
+
         raise WebServiceError("接口不存在：{0}".format(path), 404, "not_found")
 
     @staticmethod
@@ -399,6 +613,8 @@ def start_web_server(
     state_provider: Optional[Callable[[], dict[str, Any]]] = None,
     app_version: str = "",
     disk_path: Optional[str] = None,
+    auth_user: str = "",
+    auth_password: str = "",
 ) -> tuple[WebAdminServer, threading.Thread]:
     """启动 Web 管理服务（守护线程），返回 (server, thread)。"""
     bind_host = (host or "127.0.0.1").strip()
@@ -419,7 +635,16 @@ def start_web_server(
         state_provider=state_provider,
         bind_host=bind_host,
         bind_port=bind_port,
+        auth=AuthStore(auth_user, auth_password),
     )
+
+    if not context.auth.enabled:
+        print("[Web] 警告：未配置登录口令，管理界面处于无鉴权状态，请勿暴露到公网或不可信网络")
+        print("[Web] 启用方式：环境变量 DLR_WEB_PASSWORD（可选 DLR_WEB_USER），"
+              "或 config.ini [Web] 段填写 web登录用户名 / web登录密码")
+    else:
+        print("[Web] 登录鉴权已启用，访问管理界面需要先登录（连续 {0} 次失败将锁定 {1} 秒）".format(
+            LOGIN_MAX_FAILS, LOGIN_FAIL_WINDOW_SECONDS))
 
     try:
         server = WebAdminServer((bind_host, bind_port), WebAdminHandler)
