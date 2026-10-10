@@ -1,10 +1,16 @@
-version: '3.8'
-
 services:
   app:
     image: ihmily/douyin-live-recorder:latest
     environment:
       - TERM=xterm-256color
+      - UV_NO_SYNC=1
+      # 若 uv 自身需要联网（如重新解析依赖），可在这里补上 HTTP 代理；
+      # uv 是静态二进制，proxychains 的 LD_PRELOAD 对它无效
+      # - HTTPS_PROXY=http://172.17.0.1:7890
+      # - HTTP_PROXY=http://172.17.0.1:7890
+    extra_hosts:
+      # 保留映射，容器内也能用 host.docker.internal 指代宿主机
+      - "host.docker.internal:host-gateway"
     tty: true
     stdin_open: true
     #build: .
@@ -13,4 +19,5 @@ services:
       - ./logs:/app/logs
       - ./backup_config:/app/backup_config
       - ./downloads:/app/downloads
+      - ./proxychains.conf:/etc/proxychains.conf:ro
     restart: always
