@@ -42,6 +42,7 @@ jobs:
         id: prep
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           INPUT_PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
           INPUT_PUSH_IMAGE: ${{ github.event.inputs.push_image }}
         run: |
@@ -52,11 +53,27 @@ jobs:
           images="ghcr.io/${owner_lc}/${IMAGE_NAME}"
 
           has_dockerhub=false
+          dh_user=""
           # Docker Hub 仅在配置了 DOCKERHUB_USERNAME 时才加入
+          # 命名空间必须匹配 [a-z0-9]+([._-][a-z0-9]+)*，否则 buildx 会报
+          # invalid reference format（典型原因：大小写混用、首尾空白、误填成 token/邮箱）
           if [ -n "${DOCKERHUB_USERNAME:-}" ]; then
-            has_dockerhub=true
-            images="$(printf '%s\ndocker.io/%s/%s' "${images}" "${DOCKERHUB_USERNAME}" "${IMAGE_NAME}")"
+            dh_user="$(printf '%s' "${DOCKERHUB_USERNAME}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            if ! printf '%s' "$dh_user" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*$'; then
+              echo "::warning::DOCKERHUB_USERNAME 不是合法的 Docker 命名空间（仅允许小写字母、数字及 . _ - ，且不能以分隔符开头/结尾），本次跳过 Docker Hub 推送，仅推送 ghcr.io"
+              dh_user=""
+            elif [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+              echo "::warning::已配置 DOCKERHUB_USERNAME 但缺少 DOCKERHUB_TOKEN，本次跳过 Docker Hub 推送，仅推送 ghcr.io"
+              dh_user=""
+            fi
           fi
+
+          if [ -n "$dh_user" ]; then
+            has_dockerhub=true
+            images="$(printf '%s\ndocker.io/%s/%s' "${images}" "${dh_user}" "${IMAGE_NAME}")"
+          fi
+
+          echo "dockerhub_user=${dh_user}" >> "$GITHUB_OUTPUT"
 
           {
             echo "images<<EOF"
@@ -113,7 +130,7 @@ jobs:
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
         id: build
@@ -158,3 +175,8 @@ jobs:
           echo "- platforms: ${{ steps.prep.outputs.platforms }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- pushed: ${{ steps.prep.outputs.should_push }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.prep.outputs.has_dockerhub }}" = "true" ]; then
+            echo "- registry: ghcr.io + docker.io (namespace \`${{ steps.prep.outputs.dockerhub_user }}\`)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- registry: ghcr.io only（未配置或 DOCKERHUB_USERNAME 非法，已跳过 docker.io）" >> "$GITHUB_STEP_SUMMARY"
+          fi
