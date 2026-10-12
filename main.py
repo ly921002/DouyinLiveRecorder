@@ -56,6 +56,10 @@ running_list = []
 url_tuples_list = []
 url_comments = []
 text_no_repeat_url = []
+# 直播间地址 -> 该地址在配置文件中的序号（从 1 开始，按文件顺序，包含被注释的行，与 web 列表顺序一致）
+url_index_map = {}
+# 已从配置文件中删除、需要通知线程退出的地址
+removed_urls = set()
 create_var = locals()
 first_start = True
 exit_recording = False
@@ -382,7 +386,7 @@ def run_script(command: str) -> None:
 def clear_record_info(record_name: str, record_url: str) -> None:
     global monitoring
     recording.discard(record_name)
-    if record_url in url_comments and record_url in running_list:
+    if (record_url in url_comments or record_url in removed_urls) and record_url in running_list:
         running_list.remove(record_url)
         monitoring -= 1
         color_obj.print_colored(f"[{record_name}]已经从录制列表中移除\n", color_obj.YELLOW)
@@ -408,8 +412,8 @@ def direct_download_stream(source_url: str, save_path: str, record_name: str, li
                 chunk_size = 1024 * 16
 
                 for chunk in response.iter_bytes(chunk_size):
-                    if live_url in url_comments or exit_recording:
-                        color_obj.print_colored(f"[{record_name}]录制时已被注释或请求停止,下载中断", color_obj.YELLOW)
+                    if live_url in url_comments or live_url in removed_urls or exit_recording:
+                        color_obj.print_colored(f"[{record_name}]录制时已被注释/移除或请求停止,下载中断", color_obj.YELLOW)
                         clear_record_info(record_name, live_url)
                         return False
 
@@ -440,8 +444,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         create_var[subs_thread_name].start()
 
     while process.poll() is None:
-        if record_url in url_comments or exit_recording:
-            color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
+        if record_url in url_comments or record_url in removed_urls or exit_recording:
+            color_obj.print_colored(f"[{record_name}]录制时已被注释或从配置中移除,本条线程将会退出", color_obj.YELLOW)
             clear_record_info(record_name, record_url)
             # process.terminate()
             if os.name == 'nt':
@@ -1064,8 +1068,8 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                         anchor_name = clean_name(anchor_name)
                         record_name = f'序号{count_variable} {anchor_name}'
 
-                        if record_url in url_comments:
-                            print(f"[{anchor_name}]已被注释,本条线程将会退出")
+                        if record_url in url_comments or record_url in removed_urls:
+                            print(f"[{anchor_name}]已被注释或从配置中移除,本条线程将会退出")
                             clear_record_info(record_name, record_url)
                             return
 
@@ -2056,6 +2060,7 @@ while True:
 
     try:
         url_comments, line_list, url_line_list = [[] for _ in range(3)]
+        url_index_map = {}
         with (open(url_config_file, "r", encoding=text_encoding, errors='ignore') as file):
             for origin_line in file:
                 if origin_line in line_list:
@@ -2209,6 +2214,9 @@ while True:
                             url = update_file(url_config_file, old_str=url, new_str=new_url)
 
                     url_comments = [i for i in url_comments if url not in i]
+                    # 按文件顺序给直播间编号（含被注释的行），保证序号与 web 列表顺序一致、且不随集合顺序变化
+                    if url not in url_index_map:
+                        url_index_map[url] = len(url_index_map) + 1
                     if is_comment_line:
                         url_comments.append(url)
                     else:
@@ -2231,24 +2239,37 @@ while True:
                     new_word = replace_words[1]
                 update_file(url_config_file, old_str=replace_words[0], new_str=new_word, start_str=start_with)
 
-        text_no_repeat_url = list(set(url_tuples_list))
+        # 用 dict.fromkeys 去重，保留配置文件中的原始顺序（set 会因哈希随机化打乱顺序，导致序号错乱）
+        text_no_repeat_url = list(dict.fromkeys(url_tuples_list))
 
         if len(text_no_repeat_url) > 0:
             for url_tuple in text_no_repeat_url:
-                monitoring = len(running_list)
-
                 if url_tuple[1] in not_record_list:
                     continue
 
                 if url_tuple[1] not in running_list:
                     print(f"\r{'新增' if not first_start else '传入'}地址: {url_tuple[1]}")
-                    monitoring += 1
-                    args = [url_tuple, monitoring]
-                    create_var[f'thread_{monitoring}'] = threading.Thread(target=start_record, args=args)
-                    create_var[f'thread_{monitoring}'].daemon = True
-                    create_var[f'thread_{monitoring}'].start()
+                    # 序号取该地址在配置文件中的行序号，取不到时才回退为监测计数
+                    room_index = url_index_map.get(url_tuple[1], len(running_list) + 1)
+                    removed_urls.discard(url_tuple[1])
+                    args = [url_tuple, room_index]
+                    create_var[f'thread_{room_index}'] = threading.Thread(target=start_record, args=args)
+                    create_var[f'thread_{room_index}'].daemon = True
+                    create_var[f'thread_{room_index}'].start()
                     running_list.append(url_tuple[1])
                     time.sleep(local_delay_default)
+
+        # 清理已从配置文件中删除的地址：通知线程退出并同步监测数量
+        active_urls = {url_tuple[1] for url_tuple in text_no_repeat_url}
+        for stale_url in list(running_list):
+            if stale_url in active_urls or stale_url in url_comments or stale_url in not_record_list:
+                continue
+            print(f"\r地址已从配置中移除，停止监测: {stale_url}")
+            removed_urls.add(stale_url)
+            running_list.remove(stale_url)
+
+        # 监测中 = 正在监测且未在录制的直播间数量（与 web 面板统计口径一致）
+        monitoring = max(len(running_list) - len(recording), 0)
         url_tuples_list = []
         first_start = False
 
