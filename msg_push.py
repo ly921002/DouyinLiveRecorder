@@ -111,21 +111,52 @@ def send_email(email_host: str, login_email: str, email_pass: str, sender_email:
         return {"success": [], "error": receivers}
 
 
-def tg_bot(chat_id: int, token: str, content: str) -> Dict[str, Any]:
+def tg_bot(chat_id: str, token: str, content: str) -> Dict[str, Any]:
+    chat_id_text = str(chat_id).strip() if chat_id is not None else ""
+    token_text = str(token).strip() if token else ""
+
+    # 未配置 token / chat_id 时直接跳过，不要假装推送成功
+    if not token_text or not chat_id_text:
+        print('tg推送未配置已跳过：请在 config.ini 的 [推送配置] 中填写 '
+              '"tgapi令牌" 与 "tg聊天id(个人或者群组id)"')
+        return {"success": [], "error": []}
+
     try:
         json_data = {
-            "chat_id": chat_id,
+            "chat_id": chat_id_text,
             'text': content
         }
-        url = f'https://api.telegram.org/bot{token}/sendMessage'
+        url = f'https://api.telegram.org/bot{token_text}/sendMessage'
         data = json.dumps(json_data).encode('utf-8')
         req = urllib.request.Request(url, data=data, headers=headers)
         response = urllib.request.urlopen(req, timeout=15)
         json_str = response.read().decode('utf-8')
         _json_data = json.loads(json_str)
+
+        # Telegram 即使 HTTP 200 也可能返回 ok=false，必须校验，否则失败会被当成成功
+        if not _json_data.get('ok'):
+            _code = _json_data.get('error_code')
+            _desc = _json_data.get('description') or '未知错误'
+            print(f'tg推送失败, 聊天ID：{chat_id_text}, 错误码：{_code}, 错误信息: {_desc}')
+            return {"success": [], "error": [1]}
+
         return {"success": [1], "error": []}
+
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx 的响应体里同样带 Telegram 的错误说明，尽量解析出来
+        detail = ''
+        try:
+            _body = e.read().decode('utf-8')
+            _parsed = json.loads(_body)
+            detail = f"{_parsed.get('error_code')}: {_parsed.get('description') or _body}"
+        except Exception:
+            detail = str(e)
+        if e.code == 429:
+            detail = f'触发 Telegram 限流，请降低推送频率（直播推送检测频率）后重试。{detail}'
+        print(f'tg推送失败, 聊天ID：{chat_id_text}, HTTP {e.code}, 错误信息:{detail}')
+        return {"success": [], "error": [1]}
     except Exception as e:
-        print(f'tg推送失败, 聊天ID：{chat_id}, 错误信息:{e}')
+        print(f'tg推送失败, 聊天ID：{chat_id_text}, 错误信息:{e}')
         return {"success": [], "error": [1]}
 
 

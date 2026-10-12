@@ -348,8 +348,13 @@ def push_message(record_name: str, live_url: str, content: str) -> None:
         if platform in live_status_push.upper():
             try:
                 result = func()
-                print(f'提示信息：已经将[{record_name}]直播状态消息推送至你的{platform},'
-                      f' 成功{len(result["success"])}, 失败{len(result["error"])}')
+                sent, failed = len(result["success"]), len(result["error"])
+                if not sent and not failed:
+                    # 渠道已选中但未配置凭据，推送函数会主动跳过
+                    print(f'提示信息：[{platform}] 未配置凭据，已跳过推送（请检查 config.ini 的 [推送配置]）')
+                else:
+                    print(f'提示信息：已经将[{record_name}]直播状态消息推送至你的{platform},'
+                          f' 成功{sent}, 失败{failed}')
             except Exception as e:
                 color_obj.print_colored(f"直播消息推送到{platform}失败: {e}", color_obj.RED)
 
