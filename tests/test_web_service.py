@@ -546,5 +546,116 @@ class WebServerIntegrationTestCase(unittest.TestCase):
         self.assertEqual(payload["code"], "origin_mismatch")
 
 
+class CookieCheckApiTestCase(unittest.TestCase):
+    """Cookie 在线检测结果接口（/api/cookie-check 与 /api/cookies 的状态合并）。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config_file = os.path.join(self.tmp.name, "config.ini")
+        url_file = os.path.join(self.tmp.name, "URL_config.ini")
+        log_file = os.path.join(self.tmp.name, "streamget.log")
+        backup_dir = os.path.join(self.tmp.name, "backup")
+        with open(self.config_file, "w", encoding="utf-8") as file_obj:
+            file_obj.write("[Cookie]\n抖音cookie = ttwid=1\n快手cookie =\n")
+        with open(url_file, "w", encoding="utf-8") as file_obj:
+            file_obj.write("")
+        self.check_file = os.path.join(self.tmp.name, "cookie_check.json")
+
+        self.context = web_server.WebContext(
+            service.UrlConfigService(url_file, backup_dir),
+            service.ConfigService(self.config_file, backup_dir),
+            service.CookieService(self.config_file, backup_dir),
+            service.LogService(log_file),
+            service.SystemService(app_version="test"),
+            state_provider=lambda: {"version": "test", "recording": [], "running_list": []},
+            bind_host="127.0.0.1",
+            bind_port=0,
+            cookie_check_file=self.check_file,
+        )
+        self.server = web_server.WebAdminServer(("127.0.0.1", 0), web_server.WebAdminHandler)
+        self.server.context = self.context
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+
+    def request(self, method: str, path: str) -> tuple[int, bytes]:
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        connection.request(method, path)
+        response = connection.getresponse()
+        payload = response.read()
+        status = response.status
+        connection.close()
+        return status, payload
+
+    def _write_check_result(self) -> None:
+        data = {
+            "updated_at": 1700000000.0,
+            "summary": {"valid": 0, "invalid": 1, "unknown": 0, "error": 0},
+            "results": [
+                {
+                    "key": "抖音cookie",
+                    "platform": "抖音",
+                    "status": "invalid",
+                    "status_text": "失效",
+                    "detail": "接口返回未登录码 code=-101",
+                    "checked_at": 1700000000.0,
+                    "http_status": 200,
+                }
+            ],
+        }
+        with open(self.check_file, "w", encoding="utf-8") as file_obj:
+            json.dump(data, file_obj, ensure_ascii=False)
+
+    def test_cookie_check_endpoint_returns_results(self) -> None:
+        self._write_check_result()
+        status, body = self.request("GET", "/api/cookie-check")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["available"])
+        self.assertEqual(len(payload["data"]["results"]), 1)
+        self.assertEqual(payload["data"]["results"][0]["status"], "invalid")
+
+    def test_cookie_check_endpoint_without_file(self) -> None:
+        status, body = self.request("GET", "/api/cookie-check")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["data"]["available"])
+        self.assertEqual(payload["data"]["results"], [])
+
+    def test_cookie_check_endpoint_post_rejected(self) -> None:
+        status, _body = self.request("POST", "/api/cookie-check")
+        self.assertIn(status, (400, 405))
+
+    def test_cookies_api_merges_check_status(self) -> None:
+        self._write_check_result()
+        status, body = self.request("GET", "/api/cookies")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        fields = {item["key"]: item for item in payload["data"]["fields"]}
+        self.assertEqual(fields["抖音cookie"]["check_status"], "invalid")
+        self.assertEqual(fields["抖音cookie"]["check_status_text"], "失效")
+        self.assertIn("-101", fields["抖音cookie"]["check_detail"])
+        # 未参与检测（值为空）的平台不应带上状态
+        self.assertEqual(fields["快手cookie"]["check_status"], "")
+
+    def test_cookies_api_without_check_file(self) -> None:
+        status, body = self.request("GET", "/api/cookies")
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(status, 200)
+        for field in payload["data"]["fields"]:
+            self.assertEqual(field["check_status"], "")
+
+    def test_cookie_check_map_is_case_insensitive(self) -> None:
+        self._write_check_result()
+        mapping = self.context.cookie_check_map()
+        self.assertIn("抖音cookie", mapping)
+        self.assertIn("抖音cookie".lower(), mapping)
+
+
 if __name__ == "__main__":
     unittest.main()

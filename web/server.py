@@ -155,6 +155,7 @@ class WebContext:
         bind_host: str = "127.0.0.1",
         bind_port: int = 8080,
         auth: Optional[AuthStore] = None,
+        cookie_check_file: Optional[str] = None,
     ) -> None:
         self.url_service = url_service
         self.config_service = config_service
@@ -165,6 +166,43 @@ class WebContext:
         self.bind_host = bind_host
         self.bind_port = bind_port
         self.auth = auth if auth is not None else AuthStore()
+        self.cookie_check_file = cookie_check_file
+
+    def read_cookie_check(self) -> dict[str, Any]:
+        """读取 main.py 定时检测写出的结果文件；不存在时返回空结构。"""
+        empty: dict[str, Any] = {
+            "available": False,
+            "updated_at": 0,
+            "summary": {},
+            "results": [],
+        }
+        path = self.cookie_check_file
+        if not path or not os.path.isfile(path):
+            return empty
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        results = data.get("results")
+        data["results"] = results if isinstance(results, list) else []
+        data["available"] = True
+        return data
+
+    def cookie_check_map(self) -> dict[str, dict[str, Any]]:
+        """按配置键索引检测结果（同时兼容小写键，B站 在 config.ini 里有大小写两种写法）。"""
+        mapping: dict[str, dict[str, Any]] = {}
+        for item in self.read_cookie_check().get("results", []):
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "")
+            if not key:
+                continue
+            mapping[key] = item
+            mapping.setdefault(key.lower(), item)
+        return mapping
 
 
 class WebAdminServer(ThreadingHTTPServer):
@@ -526,9 +564,29 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 reveal = (query.get("reveal") or ["0"])[0]
                 show_raw = str(reveal).strip().lower() in ("1", "true", "yes", "on")
                 fields = context.cookie_service.list_cookies(reveal=show_raw)
+                # 附上最近一次在线检测的状态（失效/有效/未知/检测失败）
+                check_map = context.cookie_check_map()
+                for field in fields:
+                    key = str(field.get("key") or "")
+                    result = check_map.get(key) or check_map.get(key.lower())
+                    if result:
+                        field["check_status"] = result.get("status", "")
+                        field["check_status_text"] = result.get("status_text", "")
+                        field["check_detail"] = result.get("detail", "")
+                        field["check_at"] = result.get("checked_at", 0)
+                    else:
+                        field["check_status"] = ""
                 self._send_json(
                     200,
-                    {"ok": True, "data": {"section": "Cookie", "reveal": show_raw, "fields": fields}},
+                    {
+                        "ok": True,
+                        "data": {
+                            "section": "Cookie",
+                            "reveal": show_raw,
+                            "fields": fields,
+                            "check": context.read_cookie_check(),
+                        },
+                    },
                 )
                 return
             if method == "PUT":
@@ -541,6 +599,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 )
                 return
             raise WebServiceError("不支持的请求方法", 405, "method_not_allowed")
+
+        if path == "/api/cookie-check":
+            self._require(method, ("GET",))
+            self._send_json(200, {"ok": True, "data": context.read_cookie_check()})
+            return
 
         if path == "/api/logs":
             self._require(method, ("GET",))
@@ -636,6 +699,7 @@ def start_web_server(
         bind_host=bind_host,
         bind_port=bind_port,
         auth=AuthStore(auth_user, auth_password),
+        cookie_check_file=os.path.join(os.path.dirname(os.path.abspath(config_file)), "cookie_check.json"),
     )
 
     if not context.auth.enabled:

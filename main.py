@@ -17,6 +17,7 @@ import signal
 import threading
 import time
 import datetime
+import json
 import re
 import shutil
 import random
@@ -361,6 +362,130 @@ def push_message(record_name: str, live_url: str, content: str) -> None:
                           f' 成功{sent}, 失败{failed}')
             except Exception as e:
                 color_obj.print_colored(f"直播消息推送到{platform}失败: {e}", color_obj.RED)
+
+
+def push_cookie_alert(content: str) -> None:
+    """Cookie 失效告警。
+
+    优先走 TG（用户配置的 tg 渠道），否则回退到 [推送配置] 里已启用的其它渠道。
+    """
+    try:
+        if 'TG' in str(live_status_push).upper() and tg_token and tg_chat_id:
+            result = tg_bot(tg_chat_id, tg_token, content)
+            sent, failed = len(result["success"]), len(result["error"])
+            if sent or failed:
+                print(f'提示信息：Cookie 检测告警已推送至 TG, 成功{sent}, 失败{failed}')
+                return
+        push_message(record_name='Cookie检测', live_url='', content=content)
+    except Exception as e:
+        color_obj.print_colored(f"Cookie 检测告警推送失败: {e}", color_obj.RED)
+
+
+def cookie_check_worker() -> None:
+    """Cookie 在线有效性定时检测（守护线程）。
+
+    - 每轮重新读取 config.ini，改配置不用重启
+    - 只检测 [Cookie] 中已填写的条目
+    - 结果写入 config/cookie_check.json 供 Web 界面读取
+    - 仅在「某个平台首次变为失效」或「失效平台数变化」时推送，避免每轮刷屏
+    """
+    from src import cookie_checker
+
+    status_file = f'{script_path}/config/cookie_check.json'
+    last_status: dict[str, str] = {}
+    if os.path.isfile(status_file):
+        try:
+            with open(status_file, 'r', encoding='utf-8') as file:
+                saved = json.load(file)
+            for item in saved.get('results', []):
+                last_status[item.get('key', '')] = item.get('status', '')
+        except Exception:
+            last_status = {}
+
+    def read_local(section: str, option: str, default: str) -> str:
+        """用独立的 parser 读配置，避免与主线程共用 configparser 产生竞争。"""
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read(config_file, encoding=text_encoding)
+            return parser.get(section, option)
+        except Exception:
+            return default
+
+    while True:
+        try:
+            enabled = _parse_web_switch(read_local('Cookie检测', 'cookie检测开启(是/否)', '是'), True)
+            if not enabled:
+                time.sleep(60)
+                continue
+
+            interval = max(60, int(read_local('Cookie检测', 'cookie检测间隔(秒)', '43200') or 43200))
+            timeout = max(3, min(60, int(read_local('Cookie检测', 'cookie检测超时(秒)', '15') or 15)))
+            push_on_invalid = _parse_web_switch(read_local('Cookie检测', 'cookie失效推送(是/否)', '是'), True)
+
+            parser = configparser.RawConfigParser()
+            parser.read(config_file, encoding=text_encoding)
+            cookies = {}
+            if parser.has_section('Cookie'):
+                for key, value in parser.items('Cookie'):
+                    if (value or '').strip():
+                        cookies[key] = value.strip()
+
+            if not cookies:
+                logger.info("Cookie 检测：[Cookie] 段没有填写任何 Cookie，本轮跳过")
+            else:
+                use_proxy = options.get(read_local('录制设置', '是否使用代理ip(是/否)', '否'), False)
+                proxy_value = read_local('录制设置', '代理地址', '') if use_proxy else None
+
+                results = cookie_checker.run_check(cookies, proxy_addr=proxy_value, timeout=timeout)
+                counter = cookie_checker.summarize(results)
+                logger.info(
+                    f"Cookie 在线检测完成：有效 {counter[cookie_checker.STATUS_VALID]} / "
+                    f"失效 {counter[cookie_checker.STATUS_INVALID]} / "
+                    f"未知 {counter[cookie_checker.STATUS_UNKNOWN]} / "
+                    f"失败 {counter[cookie_checker.STATUS_ERROR]}"
+                )
+
+                invalid_items = [i for i in results if i.status == cookie_checker.STATUS_INVALID]
+                for item in invalid_items:
+                    color_obj.print_colored(
+                        f"Cookie 失效：{item.platform}（{item.key}）{item.detail}", color_obj.RED
+                    )
+                if not invalid_items:
+                    print(f"\rCookie 检测：未发现失效（共检测 {len(results)} 个平台）")
+
+                # 状态变化才推送：新失效 / 已恢复
+                new_invalid = [i for i in invalid_items if last_status.get(i.key) != cookie_checker.STATUS_INVALID]
+                recovered = [
+                    i for i in results
+                    if i.status == cookie_checker.STATUS_VALID
+                    and last_status.get(i.key) == cookie_checker.STATUS_INVALID
+                ]
+                if push_on_invalid and (new_invalid or recovered):
+                    lines = [f"Cookie 检测告警（{datetime.datetime.now():%Y-%m-%d %H:%M:%S}）"]
+                    for item in new_invalid:
+                        lines.append(f"· 失效：{item.platform} - {item.detail}")
+                    for item in recovered:
+                        lines.append(f"· 已恢复：{item.platform}")
+                    push_cookie_alert("\n".join(lines))
+
+                last_status = {item.key: item.status for item in results}
+                payload = {
+                    "updated_at": time.time(),
+                    "summary": counter,
+                    "results": [item.to_dict() for item in results],
+                }
+                try:
+                    tmp_path = f'{status_file}.tmp'
+                    with open(tmp_path, 'w', encoding='utf-8') as file:
+                        json.dump(payload, file, ensure_ascii=False, indent=2)
+                    os.replace(tmp_path, status_file)
+                except Exception as err:
+                    logger.error(f"写入 Cookie 检测结果失败: {err}")
+
+        except Exception as err:
+            logger.error(f"Cookie 检测线程异常: {err}")
+
+        time.sleep(max(60, int(read_local('Cookie检测', 'cookie检测间隔(秒)', '43200') or 43200)))
 
 
 def run_script(command: str) -> None:
@@ -1743,7 +1868,7 @@ def read_config_value(config_parser: configparser.RawConfigParser, section: str,
     try:
 
         config_parser.read(config_file, encoding=text_encoding)
-        for required_section in ('录制设置', '推送配置', 'Cookie', 'Authorization', '账号密码', 'Web'):
+        for required_section in ('录制设置', '推送配置', 'Cookie', 'Cookie检测', 'Authorization', '账号密码', 'Web'):
             if required_section not in config_parser.sections():
                 config_parser.add_section(required_section)
         if section not in config_parser.sections():
@@ -2038,6 +2163,9 @@ while True:
     laixiu_cookie = read_config_value(config, 'Cookie', 'laixiu_cookie', '')
     picarto_cookie = read_config_value(config, 'Cookie', 'picarto_cookie', '')
 
+    cookie_check_enabled = _parse_web_switch(
+        read_config_value(config, 'Cookie检测', 'cookie检测开启(是/否)', '是'), True)
+
     video_save_type_list = ("FLV", "MKV", "TS", "MP4", "MP3音频", "M4A音频", "MP3", "M4A")
     if video_save_type and video_save_type.upper() in video_save_type_list:
         video_save_type = video_save_type.upper()
@@ -2281,6 +2409,9 @@ while True:
         t.start()
         t2 = threading.Thread(target=adjust_max_request, args=(), daemon=True)
         t2.start()
+        if cookie_check_enabled:
+            t3 = threading.Thread(target=cookie_check_worker, args=(), daemon=True)
+            t3.start()
         first_run = False
 
     time.sleep(3)

@@ -12,6 +12,7 @@
     rooms: [],
     fields: [],
     cookies: { fields: [], reveal: false },
+    cookieCheck: {},
     cookieRows: [],
     logs: { lines: [] },
     system: null,
@@ -52,6 +53,7 @@
     cookieList: document.getElementById("cookieList"),
     cookieSearch: document.getElementById("cookieSearch"),
     cookieOnlyFilled: document.getElementById("cookieOnlyFilled"),
+    cookieOnlyInvalid: document.getElementById("cookieOnlyInvalid"),
     cookieMeta: document.getElementById("cookieMeta"),
     cookieEmpty: document.getElementById("cookieEmpty"),
     cookieAlert: document.getElementById("cookieAlert"),
@@ -783,11 +785,44 @@
     if (dom.cookieOnlyFilled.checked && !item.has_value) {
       return false;
     }
+    if (dom.cookieOnlyInvalid && dom.cookieOnlyInvalid.checked && item.check_status !== "invalid") {
+      return false;
+    }
     if (!keyword) {
       return true;
     }
     var haystack = ((item.label || "") + " " + (item.key || "")).toLowerCase();
     return haystack.indexOf(keyword) >= 0;
+  }
+
+  var COOKIE_STATUS_CLASS = {
+    valid: "badge-monitoring",   // 绿：有效
+    invalid: "badge-recording",  // 红：失效
+    unknown: "badge-platform",   // 蓝：未适配专用接口，无法判定
+    error: "badge-idle"          // 橙：网络异常/超时，不视为失效
+  };
+
+  function cookieStatusBadge(item) {
+    if (!item.check_status) {
+      return { cls: "badge", text: "未检测" };
+    }
+    return {
+      cls: "badge " + (COOKIE_STATUS_CLASS[item.check_status] || "badge-platform"),
+      text: item.check_status_text || item.check_status
+    };
+  }
+
+  function formatCheckedAt(ts) {
+    if (!ts) {
+      return "";
+    }
+    var date = new Date(ts * 1000);
+    if (isNaN(date.getTime())) {
+      return "";
+    }
+    var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+    return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) +
+      " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
   }
 
   function renderCookies() {
@@ -804,6 +839,16 @@
     }).length;
     dom.cookieMeta.textContent = "共 " + total + " 个平台，已填写 " + filled + " 个" + (revealed ? "（明文已载入）" : "");
 
+    var check = state.cookieCheck || {};
+    if (check.available) {
+      var summary = check.summary || {};
+      dom.cookieMeta.textContent += " · 检测于 " + (formatCheckedAt(check.updated_at) || "—") +
+        "（有效 " + (summary.valid || 0) + " / 失效 " + (summary.invalid || 0) +
+        " / 未知 " + (summary.unknown || 0) + " / 失败 " + (summary.error || 0) + "）";
+    } else {
+      dom.cookieMeta.textContent += " · 暂无检测结果";
+    }
+
     if (!fields.length) {
       dom.cookieEmpty.hidden = false;
       return;
@@ -818,6 +863,13 @@
       head.appendChild(el("span", "badge badge-platform", item.key));
       head.appendChild(el("span", "badge" + (item.has_value ? " badge-monitoring" : ""),
         item.has_value ? "已填写 " + item.length + " 字符" : "未填写"));
+      var status = cookieStatusBadge(item);
+      var statusBadge = el("span", status.cls, status.text);
+      if (item.check_detail) {
+        statusBadge.title = item.check_detail +
+          (item.check_at ? "（" + formatCheckedAt(item.check_at) + "）" : "");
+      }
+      head.appendChild(statusBadge);
       row.appendChild(head);
 
       var area = el("textarea", "input cookie-input");
@@ -872,15 +924,29 @@
     var url = "/api/cookies" + (reveal ? "?reveal=1" : "");
     return api(url).then(function (payload) {
       state.cookies = payload.data || { fields: [] };
+      state.cookieCheck = payload.data.check || {};
       renderCookies();
     }).catch(function (error) {
       toast(error.userMessage || "Cookie 列表加载失败", "error");
     });
   }
 
+  function loadCookieCheck() {
+    return api("/api/cookie-check").then(function (payload) {
+      state.cookieCheck = payload.data || {};
+      renderCookies();
+    }).catch(function () {
+      /* 检测结果读不到不影响 Cookie 编辑，静默忽略 */
+    });
+  }
+
   dom.cookieSearch.addEventListener("input", renderCookies);
   dom.cookieOnlyFilled.addEventListener("change", renderCookies);
+  if (dom.cookieOnlyInvalid) {
+    dom.cookieOnlyInvalid.addEventListener("change", renderCookies);
+  }
   dom.refreshCookiesBtn.addEventListener("click", function () {
+    loadCookieCheck();
     loadCookies(!!state.cookies.reveal);
   });
   dom.revealCookiesBtn.addEventListener("click", function () {
