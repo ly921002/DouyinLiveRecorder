@@ -150,14 +150,24 @@ class ClassifyTestCase(unittest.TestCase):
         )
         self.assertEqual(status, cc.STATUS_INVALID)
 
-    def test_pandatv_logged_in(self):
+    def test_pandatv_logged_in_shows_account(self):
+        """真实已登录响应结构：{"userInfo":{"idx":..,"id":"lirh12",...},"result":true}"""
+        body = '{"userInfo":{"idx":332083,"id":"lirh12","nick":"tester"},"result":true}'
         status, detail = cc.classify_response(
-            200, "https://api.pandalive.co.kr/v1/member/info",
-            '{"result":true,"memberInfo":{"nick":"tester"}}',
+            200, "https://api.pandalive.co.kr/v1/member/info", body,
             rule=cc.PLATFORM_PROBES["pandatv_cookie"],
         )
         self.assertEqual(status, cc.STATUS_VALID)
         self.assertIn("已登录", detail)
+        self.assertIn("lirh12", detail)
+
+    def test_pandatv_logged_in_without_userinfo(self):
+        status, detail = cc.classify_response(
+            200, "https://api.pandalive.co.kr/v1/member/info", '{"result":true}',
+            rule=cc.PLATFORM_PROBES["pandatv_cookie"],
+        )
+        self.assertEqual(status, cc.STATUS_VALID)
+        self.assertEqual(detail, "已登录")
 
     def test_pandatv_rule_uses_api_host(self):
         self.assertIn("api.pandalive.co.kr", cc.PLATFORM_PROBES["pandatv_cookie"].url)

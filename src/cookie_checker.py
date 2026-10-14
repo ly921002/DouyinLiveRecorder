@@ -66,6 +66,7 @@ class ProbeRule:
     url             探测地址（一般是平台首页或登录态接口）
     json_ok_codes   响应 JSON 里 ``code`` 字段落在这些值内视为有效（如 B站/斗鱼的 0）
     json_true_path  响应 JSON 里该路径为真值才视为有效（如 B站 data.isLogin）
+    ok_detail_path  判定为有效时，顺便取该路径的值写进说明（如 PandaTV userInfo.id -> 账号名）
     body_markers    响应体命中这些子串视为**未登录**（小写比较）
     precise         是否为精确规则；False 时判定为 valid 会降级成 unknown
     """
@@ -73,6 +74,7 @@ class ProbeRule:
     url: str
     json_ok_codes: frozenset[int] = frozenset()
     json_true_path: str | None = None
+    ok_detail_path: str | None = None
     body_markers: tuple[str, ...] = ()
     precise: bool = True
     method: str = "GET"
@@ -192,11 +194,13 @@ def _precise_probes() -> dict[str, ProbeRule]:
             url="https://www.zhihu.com/api/v4/me",
             json_ok_codes=frozenset({0}),
         ),
-        # PandaTV：未登录时返回 401 + {"result":false,"errorData":{"code":"loginMust"}}
-        # 登录后返回 {"result":true,...}，所以直接看 result 字段
+        # PandaTV：已实测两种真实响应
+        #   未登录 -> HTTP 401 + {"result":false,"errorData":{"code":"loginMust"}}
+        #   已登录 -> HTTP 200 + {"userInfo":{"idx":332083,"id":"xxx",...},"result":true}
         "pandatv_cookie": ProbeRule(
             url="https://api.pandalive.co.kr/v1/member/info",
             json_true_path="result",
+            ok_detail_path="userInfo.id",
             body_markers=("loginmust",),
             extra_headers={
                 "Origin": "https://www.pandalive.co.kr",
@@ -286,11 +290,13 @@ def classify_response(
             # 有显式登录标识时优先看它：code=0 但 isLogin=false 仍然是未登录
             if rule.json_true_path is not None:
                 flag = _dig(payload, rule.json_true_path)
-                if isinstance(flag, bool):
-                    return (STATUS_VALID, "已登录" + code_hint) if flag \
-                        else (STATUS_INVALID, "未登录" + code_hint)
-                if flag is not None:
-                    return (STATUS_VALID, "已登录" + code_hint) if flag \
+                if flag is not None and not isinstance(flag, (dict, list)):
+                    ok_detail = "已登录"
+                    if flag and rule.ok_detail_path:
+                        account = _dig(payload, rule.ok_detail_path)
+                        if account:
+                            ok_detail = f"已登录（{account}）"
+                    return (STATUS_VALID, ok_detail + code_hint) if flag \
                         else (STATUS_INVALID, "未登录" + code_hint)
 
             if isinstance(code, int):
