@@ -212,6 +212,7 @@ cookie失效推送(是/否) = 是
 | --- | --- | --- |
 | B站 | `api.bilibili.com/x/web-interface/nav` | `data.isLogin` 与 `code` |
 | 知乎 | `zhihu.com/api/v4/me` | HTTP 401 与 `code` |
+| PandaTV | `api.pandalive.co.kr/v1/member/info` | HTTP 401 与 `result`（未登录返回 `errorData.code: loginMust`） |
 
 其余平台走通用探测：带 Cookie 请求平台首页，返回 `401` / `403`、被重定向到登录页、
 或响应体命中未登录特征则判为 `失效`，否则记为 `未知`。

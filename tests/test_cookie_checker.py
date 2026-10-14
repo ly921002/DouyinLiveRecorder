@@ -131,6 +131,38 @@ class ClassifyTestCase(unittest.TestCase):
         status, _detail = cc.classify_response(200, "https://x.com/", "")
         self.assertEqual(status, cc.STATUS_UNKNOWN)
 
+    def test_pandatv_not_logged_in(self):
+        """实测未登录返回：HTTP 401 + {"result":false,"errorData":{"code":"loginMust"}}"""
+        body = ('{"result":false,"message":"\\ub85c\\uadf8\\uc778 \\ud6c4 \\uc774\\uc6a8\\ud574 '
+                '\\uc8fc\\uc138\\uc694.","errorData":{"code":"loginMust"},"userIp":"1.2.3.4"}')
+        status, detail = cc.classify_response(
+            401, "https://api.pandalive.co.kr/v1/member/info", body,
+            rule=cc.PLATFORM_PROBES["pandatv_cookie"],
+        )
+        self.assertEqual(status, cc.STATUS_INVALID)
+        self.assertIn("401", detail)
+
+    def test_pandatv_result_false_even_on_200(self):
+        status, _detail = cc.classify_response(
+            200, "https://api.pandalive.co.kr/v1/member/info",
+            '{"result":false,"errorData":{"code":"loginMust"}}',
+            rule=cc.PLATFORM_PROBES["pandatv_cookie"],
+        )
+        self.assertEqual(status, cc.STATUS_INVALID)
+
+    def test_pandatv_logged_in(self):
+        status, detail = cc.classify_response(
+            200, "https://api.pandalive.co.kr/v1/member/info",
+            '{"result":true,"memberInfo":{"nick":"tester"}}',
+            rule=cc.PLATFORM_PROBES["pandatv_cookie"],
+        )
+        self.assertEqual(status, cc.STATUS_VALID)
+        self.assertIn("已登录", detail)
+
+    def test_pandatv_rule_uses_api_host(self):
+        self.assertIn("api.pandalive.co.kr", cc.PLATFORM_PROBES["pandatv_cookie"].url)
+        self.assertEqual(cc.PLATFORM_PROBES["pandatv_cookie"].json_true_path, "result")
+
     def test_precise_rule_without_json_is_unknown(self):
         rule = cc.ProbeRule(url="https://x.com/api", json_true_path="data.isLogin")
         status, _detail = cc.classify_response(200, "https://x.com/api", "<html>风控</html>", rule=rule)

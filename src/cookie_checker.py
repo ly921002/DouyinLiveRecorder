@@ -192,6 +192,17 @@ def _precise_probes() -> dict[str, ProbeRule]:
             url="https://www.zhihu.com/api/v4/me",
             json_ok_codes=frozenset({0}),
         ),
+        # PandaTV：未登录时返回 401 + {"result":false,"errorData":{"code":"loginMust"}}
+        # 登录后返回 {"result":true,...}，所以直接看 result 字段
+        "pandatv_cookie": ProbeRule(
+            url="https://api.pandalive.co.kr/v1/member/info",
+            json_true_path="result",
+            body_markers=("loginmust",),
+            extra_headers={
+                "Origin": "https://www.pandalive.co.kr",
+                "Referer": "https://www.pandalive.co.kr/",
+            },
+        ),
     }
 
 
