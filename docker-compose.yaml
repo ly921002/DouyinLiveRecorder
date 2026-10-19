@@ -5,6 +5,9 @@ services:
     image: ghcr.io/ly921002/douyin-live-recorder:latest
     # 若要在本机从源码构建，取消下一行注释并注释掉上面的 image
     # build: .
+    # 直连：覆盖镜像默认 CMD，去掉 proxychains4 透明代理（内置 socks5 代理已失效）。
+    # 如需恢复代理翻墙，删掉本行，并把 proxychains.conf 的 [ProxyList] 换成可用 socks5 后再启用 proxychains4 启动。
+    command: uv run python main.py
     environment:
       - TERM=xterm-256color
       - UV_NO_SYNC=1
