@@ -80,6 +80,8 @@ rstr = r"[\/\\\:\*\？?\"\<\>\|&#.。,， ~！· ]"
 default_path = f'{script_path}/downloads'
 os.makedirs(default_path, exist_ok=True)
 file_update_lock = threading.Lock()
+# 每个录制线程独立的代理自检状态（首次检测 + 是否可用），用于按线程惰性探测与自愈
+_thread_local = threading.local()
 os_type = os.name
 clear_command = "cls" if os_type == 'nt' else "clear"
 color_obj = utils.Color()
@@ -706,6 +708,26 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                     for pt in extra_enable_proxy_platform_list:
                         if pt and pt.strip() in record_url:
                             proxy_address = proxy_addr_bak or None
+
+            # 代理实时自检：本线程首次进入、或尚未通过检测时探一次；不可用则禁用代理改直连重试。
+            # 已通过检测的线程不再反复探测；未通过的线程按 60s 冷却重试，实现自愈且不刷屏。
+            if proxy_address:
+                last = getattr(_thread_local, 'proxy_checked_at', 0)
+                need_check = (not getattr(_thread_local, 'proxy_checked', False)) or \
+                             (not getattr(_thread_local, 'proxy_ok', False) and (time.time() - last) >= 60)
+                if need_check:
+                    try:
+                        p_ok, p_msg = asyncio.run(utils.check_proxy_available(proxy_address))
+                    except Exception as e:
+                        p_ok, p_msg = False, f"{type(e).__name__}: {e}"
+                    _thread_local.proxy_checked = True
+                    _thread_local.proxy_checked_at = time.time()
+                    _thread_local.proxy_ok = p_ok
+                    if not p_ok:
+                        logger.warning(f"{record_url} 代理不可用({p_msg})，本次禁用代理改直连重试")
+                        proxy_address = None
+                    else:
+                        logger.debug(f"{record_url} 代理自检通过({p_msg})")
 
             # print(f'\r代理地址:{proxy_address}')
             # print(f'\r全局代理:{global_proxy}')
@@ -2049,6 +2071,19 @@ while True:
     use_proxy = options.get(read_config_value(config, '录制设置', '是否使用代理ip(是/否)', "是"), False)
     proxy_addr_bak = read_config_value(config, '录制设置', '代理地址', "")
     proxy_addr = None if not use_proxy else proxy_addr_bak
+
+    # 代理可用性自检：启动时探一次外网连通性，代理失效尽早暴露（避免海外平台跑半天才发现全挂）
+    if proxy_addr:
+        try:
+            proxy_ok, proxy_msg = asyncio.run(utils.check_proxy_available(proxy_addr))
+            if proxy_ok:
+                logger.info(f"代理检测: 正常 - {proxy_msg} ({proxy_addr})")
+            else:
+                logger.warning(f"代理检测: 不可用 - {proxy_msg} ({proxy_addr})，将自动禁用代理改直连重试")
+                proxy_addr = None
+        except Exception as e:
+            logger.warning(f"代理检测: 执行异常 - {type(e).__name__}: {e}，将自动禁用代理改直连重试")
+            proxy_addr = None
     max_request = int(read_config_value(config, '录制设置', '同一时间访问网络的线程数', 3))
     semaphore = threading.Semaphore(max_request)
     delay_default = int(read_config_value(config, '录制设置', '循环时间(秒)', 120))
