@@ -160,12 +160,14 @@ def check_disk_capacity(file_path: str | Path, show: bool = False) -> float:
 
 
 def handle_proxy_addr(proxy_addr):
-    if proxy_addr:
-        if not proxy_addr.startswith('http'):
-            proxy_addr = 'http://' + proxy_addr
-    else:
-        proxy_addr = None
-    return proxy_addr
+    if not proxy_addr:
+        return None
+    proxy_addr = proxy_addr.strip()
+    # 已带协议头（http/https/socks）直接放行
+    if re.match(r'^(https?|socks[45]h?)://', proxy_addr, re.IGNORECASE):
+        return proxy_addr
+    # 裸地址（ip:port 或 user:pass@ip:port）默认按 http 协议
+    return 'http://' + proxy_addr
 
 
 def generate_random_string(length: int) -> str:
