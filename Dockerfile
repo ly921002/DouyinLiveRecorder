@@ -19,7 +19,6 @@ ENV PYTHONUNBUFFERED=1 \
 ENV UV_PYTHON=3.11 \
     UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy \
-    PROXYCHAINS_CONF_FILE=/etc/proxychains.conf
 
 # NodeSource 主版本号，构建时可用 --build-arg NODE_MAJOR=18 覆盖
 ARG NODE_MAJOR=20
@@ -54,33 +53,8 @@ RUN set -eux; \
     node --version
 
 # ---------------------------------------------------------------------------
-# 3. proxychains-ng（提供 proxychains4 命令）
-#    Debian 官方源有该包时直接 apt 安装，否则回退到源码编译
-# ---------------------------------------------------------------------------
-RUN set -eux; \
-    apt-get update; \
-    if apt-get install -y --no-install-recommends proxychains-ng; then \
-        echo "[info] proxychains-ng installed from apt"; \
-    else \
-        echo "[warn] proxychains-ng not in apt repo, build from source"; \
-        apt-get install -y --no-install-recommends gcc make git; \
-        git clone --depth 1 https://github.com/rofl0r/proxychains-ng /tmp/proxychains-ng; \
-        cd /tmp/proxychains-ng; \
-        ./configure --prefix=/usr --sysconfdir=/etc; \
-        make -j"$(nproc)"; \
-        make install; \
-        make install-config; \
-        cd /; rm -rf /tmp/proxychains-ng; \
-    fi; \
-    rm -rf /var/lib/apt/lists/*; \
-    command -v proxychains4
-
-# 仓库内的代理配置 → 镜像默认配置路径
-COPY proxychains.conf /etc/proxychains.conf
-
-# ---------------------------------------------------------------------------
-# 4. uv + Python 依赖
-#    uv 用于运行：proxychains4 uv run python main.py
+# 3. uv + Python 依赖
+#    uv 用于运行：uv run python main.py
 #    这里预先 sync 出 /app/.venv，容器启动时就不必再联网装依赖
 # ---------------------------------------------------------------------------
 COPY pyproject.toml requirements.txt /app/
@@ -101,7 +75,7 @@ RUN uv sync || (echo "[warn] uv sync failed, fallback to uv pip install" \
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # ---------------------------------------------------------------------------
-# 5. 应用代码
+# 4. 应用代码
 # ---------------------------------------------------------------------------
 COPY . /app
 
@@ -120,4 +94,4 @@ EXPOSE 8080
 
 VOLUME ["/app/config", "/app/logs", "/app/downloads", "/app/backup_config"]
 
-CMD ["proxychains4", "uv", "run", "python", "main.py"]
+CMD ["uv", "run", "python", "main.py"]
