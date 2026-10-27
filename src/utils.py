@@ -170,6 +170,29 @@ def handle_proxy_addr(proxy_addr):
     return 'http://' + proxy_addr
 
 
+async def check_proxy_available(proxy_addr: str, test_url: str = "https://www.google.com/generate_204",
+                                timeout: int = 8) -> tuple[bool, str]:
+    """经代理探测外网连通性，用于确认 SOCKS5 / HTTP 代理是否可用。
+
+    Args:
+        proxy_addr: 原始代理字符串（支持 http:// / socks5:// / socks5h:// 或裸地址）。
+        test_url:    探测目标，默认 Google generate_204（通用外网连通性）。
+        timeout:     单次探测超时（秒）。
+
+    Returns:
+        (是否可用, 说明文字)。不可用时说明里带异常类型，方便日志定位。
+    """
+    addr = handle_proxy_addr(proxy_addr)
+    if not addr:
+        return False, "未配置代理"
+    try:
+        async with httpx.AsyncClient(proxy=addr, timeout=timeout, verify=False, http2=False) as client:
+            resp = await client.get(test_url)
+        return (resp.status_code < 500), f"OK({resp.status_code})"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def generate_random_string(length: int) -> str:
     characters = string.ascii_uppercase + string.digits
     random_string = ''.join(random.choices(characters, k=length))
