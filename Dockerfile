@@ -18,7 +18,7 @@ ENV PYTHONUNBUFFERED=1 \
 # uv 固定使用镜像自带的 python3.11，禁止联网下载解释器
 ENV UV_PYTHON=3.11 \
     UV_PYTHON_DOWNLOADS=never \
-    UV_LINK_MODE=copy \
+    UV_LINK_MODE=copy
 
 # NodeSource 主版本号，构建时可用 --build-arg NODE_MAJOR=18 覆盖
 ARG NODE_MAJOR=20
