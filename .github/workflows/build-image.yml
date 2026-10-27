@@ -158,16 +158,15 @@ jobs:
           set -eu
           echo "== image: $IMAGE"
           docker run --rm --entrypoint sh "$IMAGE" -c \
-            'command -v proxychains4 && command -v uv && command -v ffmpeg && command -v node && test -s /etc/proxychains.conf && echo "binaries OK"'
+            'command -v uv && command -v ffmpeg && command -v node && echo "binaries OK"'
           docker run --rm --entrypoint python "$IMAGE" -c "import requests, httpx, execjs, loguru, Crypto; print('python deps OK')"
           docker run --rm --entrypoint uv "$IMAGE" run python -c "import sys; print('uv run ->', sys.version.split()[0])"
           docker run --rm --entrypoint node "$IMAGE" --version
           docker run --rm --entrypoint uv "$IMAGE" run python -c "from web.server import start_web_server; print('web ui module OK')"
           docker run --rm --entrypoint ffmpeg "$IMAGE" -version | head -1
           docker run --rm "$IMAGE" ls -l /app/config/config.ini
-          # 校验 proxychains 配置能被加载（ProxyList 链首若不是数字 IP，proxychains4 会 exit 1）
-          docker run --rm "$IMAGE" proxychains4 echo "proxychains config loaded"
-          docker run --rm "$IMAGE" proxychains4 uv run python -c "print('proxychains4 + uv run OK')"
+          # 校验 socks 代理支持可用（httpx[socks]），此为 main.py 内置代理路线所需
+          docker run --rm --entrypoint uv "$IMAGE" run python -c "import httpx, httpx_socks; print('httpx socks support OK')"
 
       - name: Image summary
         if: always()
