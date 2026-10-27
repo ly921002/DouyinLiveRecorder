@@ -602,6 +602,8 @@ CONFIG_FIELD_SCHEMA: tuple[dict[str, Any], ...] = (
            "录制时同时生成时间轴字幕", "否"),
     _field("是否使用代理ip(是/否)", "使用代理 IP", "boolean",
            "录制海外平台时需要开启", "是"),
+    _field("代理地址", "代理地址", "string",
+           "格式如 socks5h://user:password@ip:port 或 https://ip:port；留空则不使用代理", ""),
     _field("使用代理录制的平台(逗号分隔)", "使用代理录制的平台", "string",
            "平台英文关键字，逗号分隔，如 tiktok, twitch", ""),
     _field("额外使用代理录制的平台(逗号分隔)", "额外使用代理录制的平台", "string",
