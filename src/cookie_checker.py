@@ -233,15 +233,14 @@ class CookieCheckResult:
 
 # --------------------------------------------------------------------- 工具
 
-def _normalize_proxy(proxy_addr: str | None) -> str | None:
+def _normalize_proxy(proxy_addr):
+    from . import utils
     if not proxy_addr:
         return None
     proxy_addr = proxy_addr.strip()
     if not proxy_addr:
         return None
-    if not proxy_addr.startswith("http"):
-        proxy_addr = "http://" + proxy_addr
-    return proxy_addr
+    return utils.handle_proxy_addr(proxy_addr)
 
 
 def _dig(data: Any, path: str) -> Any:
