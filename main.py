@@ -2073,7 +2073,8 @@ while True:
     proxy_addr = None if not use_proxy else proxy_addr_bak
 
     # 代理可用性自检：启动时探一次外网连通性，代理失效尽早暴露（避免海外平台跑半天才发现全挂）
-    if proxy_addr:
+    # 尊重「是否跳过代理检测」开关：用户关掉代理检测时连新自检也跳过
+    if proxy_addr and not skip_proxy_check:
         try:
             proxy_ok, proxy_msg = asyncio.run(utils.check_proxy_available(proxy_addr))
             if proxy_ok:
