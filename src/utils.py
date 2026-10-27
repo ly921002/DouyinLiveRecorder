@@ -163,10 +163,10 @@ def handle_proxy_addr(proxy_addr):
     if not proxy_addr:
         return None
     proxy_addr = proxy_addr.strip()
-    # 已带协议头（http/https/socks）直接放行
+    # 已带协议头（http/https/socks4/socks5/socks5h）直接放行，避免被误加 http://
     if re.match(r'^(https?|socks[45]h?)://', proxy_addr, re.IGNORECASE):
         return proxy_addr
-    # 裸地址（ip:port 或 user:pass@ip:port）默认按 http 协议
+    # 裸地址（ip:port 或 user:pass@ip:port）默认按 http 协议处理
     return 'http://' + proxy_addr
 
 
