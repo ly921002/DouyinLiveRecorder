@@ -5,7 +5,6 @@
   var listEl = document.getElementById("recList");
   var listMeta = document.getElementById("listMeta");
   var listEmpty = document.getElementById("listEmpty");
-  var placeholder = document.getElementById("placeholder");
   var controls = document.getElementById("controls");
   var nowMeta = document.getElementById("nowMeta");
   var toastEl = document.getElementById("toast");
@@ -62,7 +61,6 @@
 
     player.src = videoUrl(item.path);
     player.load();
-    placeholder.hidden = true;
     controls.hidden = false;
     nowMeta.hidden = false;
     nowMeta.innerHTML = "正在播放：<b>" + escapeHtml(item.name) + "</b>";

@@ -105,11 +105,6 @@ html, body {
   justify-content: center;
 }
 .pb-stage video { width: 100%; height: 100%; background: #000; }
-.pb-placeholder {
-  position: absolute; inset: 0;
-  display: flex; align-items: center; justify-content: center;
-  color: #aeb6c2; font-size: 14px; text-align: center; padding: 20px;
-}
 
 .pb-controls {
   display: flex;
