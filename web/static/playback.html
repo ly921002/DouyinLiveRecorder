@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>录制回放 · DouyinLiveRecorder</title>
+  <link rel="stylesheet" href="/playback.css">
+</head>
+<body>
+  <div class="pb-app">
+    <header class="pb-topbar">
+      <div class="pb-title">
+        <span class="pb-logo">DLR</span>
+        <span>录制回放</span>
+      </div>
+      <div class="pb-topbar-right">
+        <a class="pb-link" href="/" title="返回管理界面">管理界面</a>
+        <button class="pb-btn" id="logoutBtn" type="button" title="退出登录">退出</button>
+      </div>
+    </header>
+
+    <div class="pb-body">
+      <aside class="pb-list" aria-label="录制文件列表">
+        <div class="pb-list-head">
+          <h2>已录制视频</h2>
+          <button class="pb-btn pb-btn-ghost" id="refreshBtn" type="button">刷新</button>
+        </div>
+        <div class="pb-list-meta" id="listMeta">加载中…</div>
+        <ul class="pb-items" id="recList"><li class="pb-skeleton"></li><li class="pb-skeleton"></li></ul>
+        <p class="pb-empty" id="listEmpty" hidden>暂时没有可播放的 MP4 文件</p>
+      </aside>
+
+      <main class="pb-player" aria-label="播放器">
+        <div class="pb-stage" id="stage">
+          <video id="player" preload="metadata" playsinline></video>
+          <div class="pb-placeholder" id="placeholder">
+            <p>从左侧选择一段录制视频开始播放</p>
+          </div>
+        </div>
+
+        <div class="pb-controls" id="controls" hidden>
+          <button class="pb-ctrl" id="playBtn" type="button" title="播放/暂停">播放</button>
+          <span class="pb-time" id="curTime">00:00</span>
+          <input class="pb-progress" id="progress" type="range" min="0" max="1000" value="0" step="1" aria-label="进度">
+          <span class="pb-time" id="durTime">00:00</span>
+          <label class="pb-vol">
+            音量
+            <input class="pb-volume" id="volume" type="range" min="0" max="100" value="100" aria-label="音量">
+          </label>
+          <label class="pb-speed">
+            倍速
+            <select class="pb-select" id="speed">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1.0×</option>
+              <option value="1.25">1.25×</option>
+              <option value="1.5">1.5×</option>
+              <option value="2">2.0×</option>
+            </select>
+          </label>
+          <button class="pb-ctrl" id="fsBtn" type="button" title="全屏">全屏</button>
+          <a class="pb-ctrl pb-download" id="downloadBtn" download>下载</a>
+        </div>
+
+        <div class="pb-now" id="nowMeta" hidden></div>
+      </main>
+    </div>
+  </div>
+
+  <div class="pb-toast" id="toast" hidden></div>
+
+  <script src="/playback.js"></script>
+</body>
+</html>

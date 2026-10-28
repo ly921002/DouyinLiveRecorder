@@ -1,0 +1,752 @@
+diff --git a/web/server.py b/web/server.py
+index aa3d9e8..137da7e 100644
+--- a/web/server.py
++++ b/web/server.py
+@@ -7,10 +7,13 @@
+ 
+ from __future__ import annotations
+ 
++import configparser
++import email.utils
+ import hashlib
+ import hmac
+ import json
+ import os
++import re
+ import secrets
+ import threading
+ import time
+@@ -23,6 +26,7 @@ from .service import (
+     ConfigService,
+     CookieService,
+     LogService,
++    RecordingsService,
+     SystemService,
+     UrlConfigService,
+     WebServiceError,
+@@ -40,8 +44,19 @@ STATIC_FILES: dict[str, tuple[str, str]] = {
+     "/login.html": ("login.html", "text/html; charset=utf-8"),
+     "/login.css": ("login.css", "text/css; charset=utf-8"),
+     "/login.js": ("login.js", "application/javascript; charset=utf-8"),
++    # 录制回放页面（独立页面，沿用既有的同源 / 鉴权 / CSP 约束）
++    "/playback": ("playback.html", "text/html; charset=utf-8"),
++    "/playback.html": ("playback.html", "text/html; charset=utf-8"),
++    "/playback.css": ("playback.css", "text/css; charset=utf-8"),
++    "/playback.js": ("playback.js", "application/javascript; charset=utf-8"),
+ }
+ 
++# 安全响应头（静态资源与录制文件响应共用，禁止内联脚本/样式、禁止被嵌套）
++_CSP = (
++    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
++    "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
++)
++
+ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+ WILDCARD_HOSTS = ("0.0.0.0", "::", "")
+ 
+@@ -156,6 +171,7 @@ class WebContext:
+         bind_port: int = 8080,
+         auth: Optional[AuthStore] = None,
+         cookie_check_file: Optional[str] = None,
++        recordings_service: Optional[RecordingsService] = None,
+     ) -> None:
+         self.url_service = url_service
+         self.config_service = config_service
+@@ -167,6 +183,7 @@ class WebContext:
+         self.bind_port = bind_port
+         self.auth = auth if auth is not None else AuthStore()
+         self.cookie_check_file = cookie_check_file
++        self.recordings_service = recordings_service
+ 
+     def read_cookie_check(self) -> dict[str, Any]:
+         """读取 main.py 定时检测写出的结果文件；不存在时返回空结构。"""
+@@ -629,6 +646,17 @@ class WebAdminHandler(BaseHTTPRequestHandler):
+             )
+             return
+ 
++        # ---------------------------------------------------------- 录制回放
++        if path == "/api/recordings":
++            self._require(method, ("GET",))
++            self._send_json(200, {"ok": True, "data": self._recordings_list(context)})
++            return
++
++        if path == "/api/recordings/file":
++            self._require(method, ("GET", "HEAD"))
++            self._send_recording_file(context, query)
++            return
++
+         raise WebServiceError("接口不存在：{0}".format(path), 404, "not_found")
+ 
+     @staticmethod
+@@ -664,6 +692,81 @@ class WebAdminHandler(BaseHTTPRequestHandler):
+         }
+         return state
+ 
++    # ------------------------------------------------------------ 录制回放
++
++    def _recordings_list(self, context: WebContext) -> list[dict[str, Any]]:
++        service = getattr(context, "recordings_service", None)
++        if service is None:
++            return []
++        return service.list_recordings()
++
++    def _send_recording_file(self, context: WebContext, query: dict[str, list[str]]) -> None:
++        service = getattr(context, "recordings_service", None)
++        if service is None:
++            raise WebServiceError("录制回放功能未启用", 503, "not_ready")
++        rel = (query.get("path") or [""])[0]
++        file_path = service.resolve(rel)
++        try:
++            self._send_file_range(file_path, "video/mp4")
++        except WebServiceError:
++            raise
++        except OSError as error:
++            raise WebServiceError("读取录制文件失败：{0}".format(error), 500, "file_read_failed") from error
++
++    def _send_file_range(self, file_path: str, content_type: str) -> None:
++        """支持 HTTP Range 的静态文件流式响应，便于 <video> 拖拽与分段加载。"""
++        file_size = os.path.getsize(file_path)
++        range_header = (self.headers.get("Range") or "").strip()
++        start, end = 0, file_size - 1
++        partial = False
++        if range_header:
++            matched = re.match(r"bytes=(\d*)-(\d*)$", range_header)
++            if matched:
++                begin, finish = matched.group(1), matched.group(2)
++                start = int(begin) if begin else 0
++                end = int(finish) if finish else file_size - 1
++                if start < 0 or end >= file_size or start > end:
++                    self.send_response(416)
++                    self.send_header("Content-Range", "bytes */{0}".format(file_size))
++                    self.send_header("Content-Length", "0")
++                    self.end_headers()
++                    return
++                partial = True
++        length = end - start + 1
++        if partial:
++            self.send_response(206)
++            self.send_header("Content-Range", "bytes {0}-{1}/{2}".format(start, end, file_size))
++        else:
++            self.send_response(200)
++        self.send_header("Content-Type", content_type)
++        self.send_header("Content-Length", str(length))
++        self.send_header("Accept-Ranges", "bytes")
++        self.send_header("Last-Modified", email.utils.formatdate(os.path.getmtime(file_path), usegmt=True))
++        self.send_header("Cache-Control", "no-store")
++        self.send_header("X-Content-Type-Options", "nosniff")
++        self.send_header("X-Frame-Options", "DENY")
++        self.send_header("Referrer-Policy", "no-referrer")
++        self.send_header("Content-Security-Policy", _CSP)
++        self.end_headers()
++        if self.command == "HEAD":
++            return
++        self._write_file_range(file_path, start, length)
++
++    def _write_file_range(self, file_path: str, start: int, length: int) -> None:
++        chunk_size = 256 * 1024
++        sent = 0
++        try:
++            with open(file_path, "rb") as handle:
++                handle.seek(start)
++                while sent < length:
++                    data = handle.read(min(chunk_size, length - sent))
++                    if not data:
++                        break
++                    self.wfile.write(data)
++                    sent += len(data)
++        except (BrokenPipeError, ConnectionResetError):
++            pass
++
+ 
+ def start_web_server(
+     host: str = "127.0.0.1",
+@@ -689,6 +792,7 @@ def start_web_server(
+         raise WebServiceError("Web 服务端口必须在 1 到 65535 之间", 400, "port_invalid")
+ 
+     lock: threading.Lock = file_update_lock if file_update_lock is not None else threading.RLock()
++    downloads_dir = _resolve_downloads_dir(config_file, disk_path)
+     context = WebContext(
+         url_service=UrlConfigService(url_config_file, backup_dir, lock),
+         config_service=ConfigService(config_file, backup_dir, lock),
+@@ -700,6 +804,7 @@ def start_web_server(
+         bind_port=bind_port,
+         auth=AuthStore(auth_user, auth_password),
+         cookie_check_file=os.path.join(os.path.dirname(os.path.abspath(config_file)), "cookie_check.json"),
++        recordings_service=RecordingsService(downloads_dir, lock),
+     )
+ 
+     if not context.auth.enabled:
+@@ -727,6 +832,35 @@ def start_web_server(
+     return server, thread
+ 
+ 
++def _read_config_value(config_file: str, section: str, option: str, default: str) -> str:
++    """只读读取 config.ini 中单个配置值（标准库实现，不破坏原文件）。"""
++    try:
++        parser = configparser.ConfigParser()
++        parser.read(config_file, encoding="utf-8-sig")
++        if parser.has_option(section, option):
++            return (parser.get(section, option) or "").strip()
++    except Exception:
++        pass
++    return default
++
++
++def _resolve_downloads_dir(config_file: str, disk_path: Optional[str]) -> str:
++    """解析录制文件根目录。
++
++    优先级：config.ini [录制设置] 直播保存路径(不填则默认) > 调用方注入的 disk_path
++    （即默认 downloads）> <程序根目录>/downloads。相对路径按程序根目录解析。
++    """
++    app_root = os.path.dirname(STATIC_DIR)  # web 包的父目录即程序根目录
++    save_path = _read_config_value(config_file, "录制设置", "直播保存路径(不填则默认)", "")
++    if save_path:
++        if not os.path.isabs(save_path):
++            save_path = os.path.join(app_root, save_path)
++        return os.path.abspath(save_path)
++    if disk_path:
++        return os.path.abspath(disk_path)
++    return os.path.abspath(os.path.join(app_root, "downloads"))
++
++
+ def stop_web_server(server: Optional[WebAdminServer]) -> None:
+     """停止 Web 管理服务。"""
+     if server is None:
+diff --git a/web/service.py b/web/service.py
+index b3f225d..c4abee5 100644
+--- a/web/service.py
++++ b/web/service.py
+@@ -1128,3 +1128,69 @@ def build_state_provider_wrapper(provider: Optional[Callable[[], dict[str, Any]]
+             return normalize_state_snapshot({"version": "", "error": str(error)})
+ 
+     return _provider
++
++
++# ---------------------------------------------------------------- 录制回放
++
++
++class RecordingsService:
++    """扫描录制目录下的 MP4 文件，并提供防目录穿越的安全路径解析。
++
++    仅依赖标准库，不反向依赖 main。录制根目录由调用方解析后通过构造函数注入。
++    """
++
++    def __init__(self, downloads_dir: str, lock: Optional[threading.Lock] = None) -> None:
++        self.downloads_dir = os.path.abspath(downloads_dir) if downloads_dir else ""
++        self._lock = lock if lock is not None else threading.RLock()
++
++    def available(self) -> bool:
++        return bool(self.downloads_dir) and os.path.isdir(self.downloads_dir)
++
++    def list_recordings(self) -> list[dict[str, Any]]:
++        """递归扫描 downloads_dir 下的 *.mp4，按修改时间倒序返回。"""
++        if not self.available():
++            return []
++        items: list[dict[str, Any]] = []
++        try:
++            with self._lock:
++                for root, _dirs, files in os.walk(self.downloads_dir):
++                    for name in files:
++                        if not name.lower().endswith(".mp4"):
++                            continue
++                        full = os.path.join(root, name)
++                        try:
++                            stat = os.stat(full)
++                        except OSError:
++                            continue
++                        rel = os.path.relpath(full, self.downloads_dir).replace(os.sep, "/")
++                        items.append(
++                            {
++                                "path": rel,
++                                "name": name,
++                                "size": stat.st_size,
++                                "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).strftime(
++                                    "%Y-%m-%d %H:%M:%S"
++                                ),
++                                "mtime_ts": int(stat.st_mtime),
++                            }
++                        )
++        except OSError as error:
++            raise WebServiceError("扫描录制目录失败：{0}".format(error), 500, "scan_failed") from error
++        items.sort(key=lambda item: item.get("mtime_ts", 0), reverse=True)
++        return items
++
++    def resolve(self, rel_path: str) -> str:
++        """把相对路径解析为绝对路径，并严格禁止目录穿越。"""
++        if not rel_path:
++            raise WebServiceError("缺少文件参数", 400, "missing_path")
++        if not self.available():
++            raise WebServiceError("录制目录不可用", 503, "dir_unavailable")
++        # 统一为正斜杠，避免 Windows 反斜杠被当作路径段分隔而绕过校验
++        rel_path = rel_path.replace("\\", "/")
++        base = os.path.realpath(self.downloads_dir)
++        target = os.path.realpath(os.path.join(base, rel_path))
++        if target != base and not target.startswith(base + os.sep):
++            raise WebServiceError("非法文件路径", 403, "path_forbidden")
++        if not os.path.isfile(target):
++            raise WebServiceError("文件不存在", 404, "file_missing")
++        return target
+diff --git a/web/static/index.html b/web/static/index.html
+index 699b50f..21aa497 100644
+--- a/web/static/index.html
++++ b/web/static/index.html
+@@ -53,6 +53,7 @@
+         <span class="live-dot" id="liveDot" title="轮询状态"></span>
+         <span class="topbar-meta" id="pollMeta">每 5 秒刷新</span>
+         <button class="icon-btn" id="themeBtn" type="button" title="切换主题">暗色</button>
++        <a class="icon-btn" id="playbackLink" href="/playback" title="录制回放">回放</a>
+         <button class="icon-btn" id="logoutBtn" type="button" title="退出登录">退出</button>
+       </div>
+     </header>
+diff --git a/web/static/playback.css b/web/static/playback.css
+new file mode 100644
+index 0000000..60b9af0
+--- /dev/null
++++ b/web/static/playback.css
+@@ -0,0 +1,180 @@
++:root {
++  --bg: #f4f6fb;
++  --panel: #ffffff;
++  --border: #e3e8f0;
++  --text: #1f2733;
++  --muted: #6b7686;
++  --primary: #283593;
++  --primary-2: #1a237e;
++  --recording: #e53935;
++  --shadow: 0 2px 8px rgba(20, 30, 60, 0.08);
++}
++
++* { box-sizing: border-box; }
++
++html, body {
++  margin: 0;
++  height: 100%;
++  background: var(--bg);
++  color: var(--text);
++  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
++}
++
++.pb-app { display: flex; flex-direction: column; height: 100vh; }
++
++.pb-topbar {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding: 10px 16px;
++  background: var(--panel);
++  border-bottom: 1px solid var(--border);
++  box-shadow: var(--shadow);
++}
++.pb-title { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; }
++.pb-logo {
++  display: inline-flex; align-items: center; justify-content: center;
++  width: 30px; height: 30px; border-radius: 8px;
++  background: linear-gradient(120deg, var(--primary), var(--primary-2));
++  color: #fff; font-size: 12px; font-weight: 800; letter-spacing: 0.5px;
++}
++.pb-topbar-right { display: flex; align-items: center; gap: 10px; }
++.pb-link { color: var(--primary); text-decoration: none; font-size: 14px; }
++.pb-link:hover { text-decoration: underline; }
++
++.pb-btn {
++  border: 1px solid var(--border);
++  background: var(--panel);
++  color: var(--text);
++  border-radius: 8px;
++  padding: 6px 12px;
++  font-size: 14px;
++  cursor: pointer;
++  transition: background 0.2s, border-color 0.2s;
++}
++.pb-btn:hover { border-color: var(--primary); color: var(--primary); }
++.pb-btn-ghost { background: transparent; }
++
++.pb-body { display: flex; flex: 1; min-height: 0; }
++
++.pb-list {
++  width: 320px;
++  flex: 0 0 320px;
++  background: var(--panel);
++  border-right: 1px solid var(--border);
++  display: flex;
++  flex-direction: column;
++  min-height: 0;
++}
++.pb-list-head {
++  display: flex; align-items: center; justify-content: space-between;
++  padding: 14px 16px 8px;
++}
++.pb-list-head h2 { margin: 0; font-size: 15px; }
++.pb-list-meta { padding: 0 16px 8px; color: var(--muted); font-size: 12px; }
++
++.pb-items { list-style: none; margin: 0; padding: 0 8px 16px; overflow-y: auto; flex: 1; }
++.pb-item {
++  padding: 10px 12px;
++  border-radius: 10px;
++  cursor: pointer;
++  border: 1px solid transparent;
++  transition: background 0.15s, border-color 0.15s;
++}
++.pb-item:hover { background: #eef1f8; }
++.pb-item.is-active { background: #e8ebfb; border-color: var(--primary); }
++.pb-item-name { font-size: 14px; font-weight: 600; word-break: break-all; }
++.pb-item-sub { margin-top: 4px; color: var(--muted); font-size: 12px; display: flex; gap: 10px; }
++.pb-item-path { color: #9aa4b2; font-size: 11px; word-break: break-all; margin-top: 2px; }
++
++.pb-skeleton { height: 44px; margin: 8px 0; border-radius: 10px; background: linear-gradient(90deg, #eef1f8, #e3e8f0, #eef1f8); }
++
++.pb-empty { padding: 20px 16px; color: var(--muted); font-size: 13px; text-align: center; }
++
++.pb-player { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 16px; gap: 12px; }
++
++.pb-stage {
++  position: relative;
++  flex: 1;
++  min-height: 0;
++  background: #000;
++  border-radius: 12px;
++  overflow: hidden;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++}
++.pb-stage video { width: 100%; height: 100%; background: #000; }
++.pb-placeholder {
++  position: absolute; inset: 0;
++  display: flex; align-items: center; justify-content: center;
++  color: #aeb6c2; font-size: 14px; text-align: center; padding: 20px;
++}
++
++.pb-controls {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  background: var(--panel);
++  border: 1px solid var(--border);
++  border-radius: 12px;
++  padding: 10px 14px;
++  box-shadow: var(--shadow);
++  flex-wrap: wrap;
++}
++.pb-ctrl {
++  border: 1px solid var(--border);
++  background: var(--panel);
++  color: var(--text);
++  border-radius: 8px;
++  padding: 7px 14px;
++  font-size: 14px;
++  cursor: pointer;
++  text-decoration: none;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++}
++.pb-ctrl:hover { border-color: var(--primary); color: var(--primary); }
++.pb-download { background: var(--primary); color: #fff; border-color: var(--primary); }
++.pb-download:hover { background: var(--primary-2); color: #fff; }
++
++.pb-progress { flex: 1; min-width: 160px; accent-color: var(--primary); cursor: pointer; }
++.pb-time { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--muted); min-width: 44px; text-align: center; }
++.pb-vol, .pb-speed { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
++.pb-volume { width: 90px; accent-color: var(--primary); cursor: pointer; }
++.pb-select {
++  border: 1px solid var(--border);
++  border-radius: 8px;
++  padding: 6px 8px;
++  background: var(--panel);
++  font-size: 13px;
++  color: var(--text);
++  cursor: pointer;
++}
++
++.pb-now {
++  font-size: 13px;
++  color: var(--muted);
++  padding: 2px 4px;
++}
++.pb-now b { color: var(--text); }
++
++.pb-toast {
++  position: fixed;
++  left: 50%;
++  bottom: 28px;
++  transform: translateX(-50%);
++  background: #2b3242;
++  color: #fff;
++  padding: 10px 18px;
++  border-radius: 10px;
++  font-size: 14px;
++  box-shadow: var(--shadow);
++  z-index: 50;
++}
++
++@media (max-width: 720px) {
++  .pb-body { flex-direction: column; }
++  .pb-list { width: auto; flex: 0 0 200px; border-right: none; border-bottom: 1px solid var(--border); }
++}
+diff --git a/web/static/playback.html b/web/static/playback.html
+new file mode 100644
+index 0000000..bcac032
+--- /dev/null
++++ b/web/static/playback.html
+@@ -0,0 +1,73 @@
++<!DOCTYPE html>
++<html lang="zh-CN">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <title>录制回放 · DouyinLiveRecorder</title>
++  <link rel="stylesheet" href="/playback.css">
++</head>
++<body>
++  <div class="pb-app">
++    <header class="pb-topbar">
++      <div class="pb-title">
++        <span class="pb-logo">DLR</span>
++        <span>录制回放</span>
++      </div>
++      <div class="pb-topbar-right">
++        <a class="pb-link" href="/" title="返回管理界面">管理界面</a>
++        <button class="pb-btn" id="logoutBtn" type="button" title="退出登录">退出</button>
++      </div>
++    </header>
++
++    <div class="pb-body">
++      <aside class="pb-list" aria-label="录制文件列表">
++        <div class="pb-list-head">
++          <h2>已录制视频</h2>
++          <button class="pb-btn pb-btn-ghost" id="refreshBtn" type="button">刷新</button>
++        </div>
++        <div class="pb-list-meta" id="listMeta">加载中…</div>
++        <ul class="pb-items" id="recList"><li class="pb-skeleton"></li><li class="pb-skeleton"></li></ul>
++        <p class="pb-empty" id="listEmpty" hidden>暂时没有可播放的 MP4 文件</p>
++      </aside>
++
++      <main class="pb-player" aria-label="播放器">
++        <div class="pb-stage" id="stage">
++          <video id="player" preload="metadata" playsinline></video>
++          <div class="pb-placeholder" id="placeholder">
++            <p>从左侧选择一段录制视频开始播放</p>
++          </div>
++        </div>
++
++        <div class="pb-controls" id="controls" hidden>
++          <button class="pb-ctrl" id="playBtn" type="button" title="播放/暂停">播放</button>
++          <span class="pb-time" id="curTime">00:00</span>
++          <input class="pb-progress" id="progress" type="range" min="0" max="1000" value="0" step="1" aria-label="进度">
++          <span class="pb-time" id="durTime">00:00</span>
++          <label class="pb-vol">
++            音量
++            <input class="pb-volume" id="volume" type="range" min="0" max="100" value="100" aria-label="音量">
++          </label>
++          <label class="pb-speed">
++            倍速
++            <select class="pb-select" id="speed">
++              <option value="0.5">0.5×</option>
++              <option value="1" selected>1.0×</option>
++              <option value="1.25">1.25×</option>
++              <option value="1.5">1.5×</option>
++              <option value="2">2.0×</option>
++            </select>
++          </label>
++          <button class="pb-ctrl" id="fsBtn" type="button" title="全屏">全屏</button>
++          <a class="pb-ctrl pb-download" id="downloadBtn" download>下载</a>
++        </div>
++
++        <div class="pb-now" id="nowMeta" hidden></div>
++      </main>
++    </div>
++  </div>
++
++  <div class="pb-toast" id="toast" hidden></div>
++
++  <script src="/playback.js"></script>
++</body>
++</html>
+diff --git a/web/static/playback.js b/web/static/playback.js
+new file mode 100644
+index 0000000..9e2a07b
+--- /dev/null
++++ b/web/static/playback.js
+@@ -0,0 +1,181 @@
++"use strict";
++
++(function () {
++  var player = document.getElementById("player");
++  var listEl = document.getElementById("recList");
++  var listMeta = document.getElementById("listMeta");
++  var listEmpty = document.getElementById("listEmpty");
++  var placeholder = document.getElementById("placeholder");
++  var controls = document.getElementById("controls");
++  var nowMeta = document.getElementById("nowMeta");
++  var toastEl = document.getElementById("toast");
++
++  var playBtn = document.getElementById("playBtn");
++  var progress = document.getElementById("progress");
++  var curTime = document.getElementById("curTime");
++  var durTime = document.getElementById("durTime");
++  var volume = document.getElementById("volume");
++  var speed = document.getElementById("speed");
++  var fsBtn = document.getElementById("fsBtn");
++  var downloadBtn = document.getElementById("downloadBtn");
++  var refreshBtn = document.getElementById("refreshBtn");
++  var logoutBtn = document.getElementById("logoutBtn");
++  var stage = document.getElementById("stage");
++
++  var current = null;
++
++  function toast(msg) {
++    toastEl.textContent = msg;
++    toastEl.hidden = false;
++    clearTimeout(toast._t);
++    toast._t = setTimeout(function () { toastEl.hidden = true; }, 2600);
++  }
++
++  function fmtSize(bytes) {
++    if (!bytes && bytes !== 0) return "-";
++    var units = ["B", "KB", "MB", "GB"];
++    var i = 0, n = Number(bytes);
++    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
++    return n.toFixed(i === 0 ? 0 : 1) + " " + units[i];
++  }
++
++  function fmtTime(sec) {
++    if (!isFinite(sec) || sec < 0) sec = 0;
++    var s = Math.floor(sec % 60);
++    var m = Math.floor((sec / 60) % 60);
++    var h = Math.floor(sec / 3600);
++    var mm = h > 0 ? String(m).padStart(2, "0") : String(m);
++    var ss = String(s).padStart(2, "0");
++    return h > 0 ? h + ":" + mm + ":" + ss : mm + ":" + ss;
++  }
++
++  function videoUrl(path) {
++    return "/api/recordings/file?path=" + encodeURIComponent(path);
++  }
++
++  function selectItem(item, node) {
++    current = item;
++    Array.prototype.forEach.call(listEl.querySelectorAll(".pb-item"), function (n) {
++      n.classList.remove("is-active");
++    });
++    if (node) node.classList.add("is-active");
++
++    player.src = videoUrl(item.path);
++    player.load();
++    placeholder.hidden = true;
++    controls.hidden = false;
++    nowMeta.hidden = false;
++    nowMeta.innerHTML = "正在播放：<b>" + escapeHtml(item.name) + "</b>";
++    downloadBtn.href = videoUrl(item.path);
++    downloadBtn.setAttribute("download", item.name);
++    player.play().catch(function () { /* 自动播放被拦截时由用户手动点击 */ });
++  }
++
++  function escapeHtml(s) {
++    return String(s).replace(/[&<>"']/g, function (c) {
++      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
++    });
++  }
++
++  function renderList(items) {
++    listEl.innerHTML = "";
++    if (!items.length) {
++      listEmpty.hidden = false;
++      listMeta.textContent = "没有找到 MP4 文件";
++      return;
++    }
++    listEmpty.hidden = true;
++    listMeta.textContent = "共 " + items.length + " 个文件";
++    items.forEach(function (item) {
++      var li = document.createElement("li");
++      li.className = "pb-item";
++      li.innerHTML =
++        '<div class="pb-item-name"></div>' +
++        '<div class="pb-item-sub"><span class="sz"></span><span class="mt"></span></div>' +
++        '<div class="pb-item-path"></div>';
++      li.querySelector(".pb-item-name").textContent = item.name;
++      li.querySelector(".sz").textContent = fmtSize(item.size);
++      li.querySelector(".mt").textContent = item.mtime || "";
++      li.querySelector(".pb-item-path").textContent = item.path;
++      li.addEventListener("click", function () { selectItem(item, li); });
++      listEl.appendChild(li);
++    });
++  }
++
++  function loadList() {
++    listMeta.textContent = "加载中…";
++    fetch("/api/recordings", { credentials: "same-origin" })
++      .then(function (res) {
++        if (res.status === 401) { location.href = "/login"; return null; }
++        if (!res.ok) throw new Error("HTTP " + res.status);
++        return res.json();
++      })
++      .then(function (data) {
++        if (!data) return;
++        if (!data.ok) throw new Error(data.error || "加载失败");
++        renderList(data.data || []);
++      })
++      .catch(function (err) {
++        listMeta.textContent = "加载失败";
++        toast("获取录制列表失败：" + err.message);
++      });
++  }
++
++  // ---- 播放控制 ----
++  playBtn.addEventListener("click", function () {
++    if (player.paused) { player.play(); } else { player.pause(); }
++  });
++
++  player.addEventListener("play", function () { playBtn.textContent = "暂停"; });
++  player.addEventListener("pause", function () { playBtn.textContent = "播放"; });
++
++  player.addEventListener("loadedmetadata", function () {
++    durTime.textContent = fmtTime(player.duration);
++  });
++
++  player.addEventListener("timeupdate", function () {
++    curTime.textContent = fmtTime(player.currentTime);
++    if (player.duration) {
++      progress.value = String(Math.floor((player.currentTime / player.duration) * 1000));
++    }
++  });
++
++  progress.addEventListener("input", function () {
++    if (player.duration) {
++      player.currentTime = (Number(progress.value) / 1000) * player.duration;
++    }
++  });
++
++  volume.addEventListener("input", function () {
++    player.volume = Number(volume.value) / 100;
++    player.muted = player.volume === 0;
++  });
++
++  speed.addEventListener("change", function () {
++    player.playbackRate = Number(speed.value);
++  });
++
++  player.addEventListener("error", function () {
++    if (player.src) toast("视频加载失败，可能文件正在写入或已损坏");
++  });
++
++  fsBtn.addEventListener("click", function () {
++    var el = document.fullscreenElement ? document : stage;
++    var target = stage;
++    if (!document.fullscreenElement) {
++      (target.requestFullscreen || target.webkitRequestFullscreen || function () {}).call(target);
++    } else {
++      (document.exitFullscreen || document.webkitExitFullscreen || function () {}).call(document);
++    }
++  });
++
++  refreshBtn.addEventListener("click", loadList);
++
++  logoutBtn.addEventListener("click", function () {
++    fetch("/api/logout", { method: "POST", credentials: "same-origin" })
++      .then(function () { location.href = "/login"; })
++      .catch(function () { location.href = "/login"; });
++  });
++
++  loadList();
++})();

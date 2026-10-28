@@ -1128,3 +1128,69 @@ def build_state_provider_wrapper(provider: Optional[Callable[[], dict[str, Any]]
             return normalize_state_snapshot({"version": "", "error": str(error)})
 
     return _provider
+
+
+# ---------------------------------------------------------------- 录制回放
+
+
+class RecordingsService:
+    """扫描录制目录下的 MP4 文件，并提供防目录穿越的安全路径解析。
+
+    仅依赖标准库，不反向依赖 main。录制根目录由调用方解析后通过构造函数注入。
+    """
+
+    def __init__(self, downloads_dir: str, lock: Optional[threading.Lock] = None) -> None:
+        self.downloads_dir = os.path.abspath(downloads_dir) if downloads_dir else ""
+        self._lock = lock if lock is not None else threading.RLock()
+
+    def available(self) -> bool:
+        return bool(self.downloads_dir) and os.path.isdir(self.downloads_dir)
+
+    def list_recordings(self) -> list[dict[str, Any]]:
+        """递归扫描 downloads_dir 下的 *.mp4，按修改时间倒序返回。"""
+        if not self.available():
+            return []
+        items: list[dict[str, Any]] = []
+        try:
+            with self._lock:
+                for root, _dirs, files in os.walk(self.downloads_dir):
+                    for name in files:
+                        if not name.lower().endswith(".mp4"):
+                            continue
+                        full = os.path.join(root, name)
+                        try:
+                            stat = os.stat(full)
+                        except OSError:
+                            continue
+                        rel = os.path.relpath(full, self.downloads_dir).replace(os.sep, "/")
+                        items.append(
+                            {
+                                "path": rel,
+                                "name": name,
+                                "size": stat.st_size,
+                                "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).strftime(
+                                    "%Y-%m-%d %H:%M:%S"
+                                ),
+                                "mtime_ts": int(stat.st_mtime),
+                            }
+                        )
+        except OSError as error:
+            raise WebServiceError("扫描录制目录失败：{0}".format(error), 500, "scan_failed") from error
+        items.sort(key=lambda item: item.get("mtime_ts", 0), reverse=True)
+        return items
+
+    def resolve(self, rel_path: str) -> str:
+        """把相对路径解析为绝对路径，并严格禁止目录穿越。"""
+        if not rel_path:
+            raise WebServiceError("缺少文件参数", 400, "missing_path")
+        if not self.available():
+            raise WebServiceError("录制目录不可用", 503, "dir_unavailable")
+        # 统一为正斜杠，避免 Windows 反斜杠被当作路径段分隔而绕过校验
+        rel_path = rel_path.replace("\\", "/")
+        base = os.path.realpath(self.downloads_dir)
+        target = os.path.realpath(os.path.join(base, rel_path))
+        if target != base and not target.startswith(base + os.sep):
+            raise WebServiceError("非法文件路径", 403, "path_forbidden")
+        if not os.path.isfile(target):
+            raise WebServiceError("文件不存在", 404, "file_missing")
+        return target

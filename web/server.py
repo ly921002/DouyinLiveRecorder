@@ -7,10 +7,13 @@
 
 from __future__ import annotations
 
+import configparser
+import email.utils
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -23,6 +26,7 @@ from .service import (
     ConfigService,
     CookieService,
     LogService,
+    RecordingsService,
     SystemService,
     UrlConfigService,
     WebServiceError,
@@ -40,7 +44,18 @@ STATIC_FILES: dict[str, tuple[str, str]] = {
     "/login.html": ("login.html", "text/html; charset=utf-8"),
     "/login.css": ("login.css", "text/css; charset=utf-8"),
     "/login.js": ("login.js", "application/javascript; charset=utf-8"),
+    # 录制回放页面（独立页面，沿用既有的同源 / 鉴权 / CSP 约束）
+    "/playback": ("playback.html", "text/html; charset=utf-8"),
+    "/playback.html": ("playback.html", "text/html; charset=utf-8"),
+    "/playback.css": ("playback.css", "text/css; charset=utf-8"),
+    "/playback.js": ("playback.js", "application/javascript; charset=utf-8"),
 }
+
+# 安全响应头（静态资源与录制文件响应共用，禁止内联脚本/样式、禁止被嵌套）
+_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+    "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+)
 
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
 WILDCARD_HOSTS = ("0.0.0.0", "::", "")
@@ -156,6 +171,7 @@ class WebContext:
         bind_port: int = 8080,
         auth: Optional[AuthStore] = None,
         cookie_check_file: Optional[str] = None,
+        recordings_service: Optional[RecordingsService] = None,
     ) -> None:
         self.url_service = url_service
         self.config_service = config_service
@@ -167,6 +183,7 @@ class WebContext:
         self.bind_port = bind_port
         self.auth = auth if auth is not None else AuthStore()
         self.cookie_check_file = cookie_check_file
+        self.recordings_service = recordings_service
 
     def read_cookie_check(self) -> dict[str, Any]:
         """读取 main.py 定时检测写出的结果文件；不存在时返回空结构。"""
@@ -629,6 +646,17 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # ---------------------------------------------------------- 录制回放
+        if path == "/api/recordings":
+            self._require(method, ("GET",))
+            self._send_json(200, {"ok": True, "data": self._recordings_list(context)})
+            return
+
+        if path == "/api/recordings/file":
+            self._require(method, ("GET", "HEAD"))
+            self._send_recording_file(context, query)
+            return
+
         raise WebServiceError("接口不存在：{0}".format(path), 404, "not_found")
 
     @staticmethod
@@ -664,6 +692,81 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         }
         return state
 
+    # ------------------------------------------------------------ 录制回放
+
+    def _recordings_list(self, context: WebContext) -> list[dict[str, Any]]:
+        service = getattr(context, "recordings_service", None)
+        if service is None:
+            return []
+        return service.list_recordings()
+
+    def _send_recording_file(self, context: WebContext, query: dict[str, list[str]]) -> None:
+        service = getattr(context, "recordings_service", None)
+        if service is None:
+            raise WebServiceError("录制回放功能未启用", 503, "not_ready")
+        rel = (query.get("path") or [""])[0]
+        file_path = service.resolve(rel)
+        try:
+            self._send_file_range(file_path, "video/mp4")
+        except WebServiceError:
+            raise
+        except OSError as error:
+            raise WebServiceError("读取录制文件失败：{0}".format(error), 500, "file_read_failed") from error
+
+    def _send_file_range(self, file_path: str, content_type: str) -> None:
+        """支持 HTTP Range 的静态文件流式响应，便于 <video> 拖拽与分段加载。"""
+        file_size = os.path.getsize(file_path)
+        range_header = (self.headers.get("Range") or "").strip()
+        start, end = 0, file_size - 1
+        partial = False
+        if range_header:
+            matched = re.match(r"bytes=(\d*)-(\d*)$", range_header)
+            if matched:
+                begin, finish = matched.group(1), matched.group(2)
+                start = int(begin) if begin else 0
+                end = int(finish) if finish else file_size - 1
+                if start < 0 or end >= file_size or start > end:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */{0}".format(file_size))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                partial = True
+        length = end - start + 1
+        if partial:
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes {0}-{1}/{2}".format(start, end, file_size))
+        else:
+            self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Last-Modified", email.utils.formatdate(os.path.getmtime(file_path), usegmt=True))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", _CSP)
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        self._write_file_range(file_path, start, length)
+
+    def _write_file_range(self, file_path: str, start: int, length: int) -> None:
+        chunk_size = 256 * 1024
+        sent = 0
+        try:
+            with open(file_path, "rb") as handle:
+                handle.seek(start)
+                while sent < length:
+                    data = handle.read(min(chunk_size, length - sent))
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    sent += len(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
 
 def start_web_server(
     host: str = "127.0.0.1",
@@ -689,6 +792,7 @@ def start_web_server(
         raise WebServiceError("Web 服务端口必须在 1 到 65535 之间", 400, "port_invalid")
 
     lock: threading.Lock = file_update_lock if file_update_lock is not None else threading.RLock()
+    downloads_dir = _resolve_downloads_dir(config_file, disk_path)
     context = WebContext(
         url_service=UrlConfigService(url_config_file, backup_dir, lock),
         config_service=ConfigService(config_file, backup_dir, lock),
@@ -700,6 +804,7 @@ def start_web_server(
         bind_port=bind_port,
         auth=AuthStore(auth_user, auth_password),
         cookie_check_file=os.path.join(os.path.dirname(os.path.abspath(config_file)), "cookie_check.json"),
+        recordings_service=RecordingsService(downloads_dir, lock),
     )
 
     if not context.auth.enabled:
@@ -725,6 +830,35 @@ def start_web_server(
     )
     thread.start()
     return server, thread
+
+
+def _read_config_value(config_file: str, section: str, option: str, default: str) -> str:
+    """只读读取 config.ini 中单个配置值（标准库实现，不破坏原文件）。"""
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(config_file, encoding="utf-8-sig")
+        if parser.has_option(section, option):
+            return (parser.get(section, option) or "").strip()
+    except Exception:
+        pass
+    return default
+
+
+def _resolve_downloads_dir(config_file: str, disk_path: Optional[str]) -> str:
+    """解析录制文件根目录。
+
+    优先级：config.ini [录制设置] 直播保存路径(不填则默认) > 调用方注入的 disk_path
+    （即默认 downloads）> <程序根目录>/downloads。相对路径按程序根目录解析。
+    """
+    app_root = os.path.dirname(STATIC_DIR)  # web 包的父目录即程序根目录
+    save_path = _read_config_value(config_file, "录制设置", "直播保存路径(不填则默认)", "")
+    if save_path:
+        if not os.path.isabs(save_path):
+            save_path = os.path.join(app_root, save_path)
+        return os.path.abspath(save_path)
+    if disk_path:
+        return os.path.abspath(disk_path)
+    return os.path.abspath(os.path.join(app_root, "downloads"))
 
 
 def stop_web_server(server: Optional[WebAdminServer]) -> None:
