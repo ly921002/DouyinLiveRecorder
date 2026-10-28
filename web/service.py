@@ -22,6 +22,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urlsplit
 
@@ -1139,17 +1140,32 @@ class RecordingsService:
     仅依赖标准库，不反向依赖 main。录制根目录由调用方解析后通过构造函数注入。
     """
 
+    # 列表结果缓存时间（秒）。录制目录文件数量可能很大，避免每次刷新列表
+    # 都做一次整树遍历 + 逐文件 stat。
+    CACHE_TTL_SECONDS = 10.0
+    # 判定「仍在录制」的时间窗口（秒）。最近仍有写入的 MP4 没有完整的 moov 索引，
+    # 浏览器既读不到时长也取不到关键帧表，必须显式告知用户而不是让他点了才发现不能播。
+    RECORDING_WINDOW_SECONDS = 60
+
     def __init__(self, downloads_dir: str, lock: Optional[threading.Lock] = None) -> None:
         self.downloads_dir = os.path.abspath(downloads_dir) if downloads_dir else ""
         self._lock = lock if lock is not None else threading.RLock()
+        self._cache: Optional[list[dict[str, Any]]] = None
+        self._cache_ts = 0.0
 
     def available(self) -> bool:
         return bool(self.downloads_dir) and os.path.isdir(self.downloads_dir)
 
-    def list_recordings(self) -> list[dict[str, Any]]:
-        """递归扫描 downloads_dir 下的 *.mp4，按修改时间倒序返回。"""
+    def list_recordings(self, force: bool = False) -> list[dict[str, Any]]:
+        """递归扫描 downloads_dir 下的 *.mp4，按修改时间倒序返回。
+
+        force=False 时走 TTL 缓存；用户主动刷新应传 force=True 以绕过缓存。
+        """
         if not self.available():
             return []
+        now = time.time()
+        if not force and self._cache is not None and now - self._cache_ts < self.CACHE_TTL_SECONDS:
+            return list(self._cache)
         items: list[dict[str, Any]] = []
         try:
             with self._lock:
@@ -1172,12 +1188,16 @@ class RecordingsService:
                                     "%Y-%m-%d %H:%M:%S"
                                 ),
                                 "mtime_ts": int(stat.st_mtime),
+                                # 最近仍在写入视为「录制中」，前端据此标注不可完整拖拽
+                                "recording": (now - stat.st_mtime) < self.RECORDING_WINDOW_SECONDS,
                             }
                         )
         except OSError as error:
             raise WebServiceError("扫描录制目录失败：{0}".format(error), 500, "scan_failed") from error
         items.sort(key=lambda item: item.get("mtime_ts", 0), reverse=True)
-        return items
+        self._cache = items
+        self._cache_ts = time.time()
+        return list(items)
 
     def resolve(self, rel_path: str) -> str:
         """把相对路径解析为绝对路径，并严格禁止目录穿越。"""

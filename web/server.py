@@ -649,7 +649,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         # ---------------------------------------------------------- 录制回放
         if path == "/api/recordings":
             self._require(method, ("GET",))
-            self._send_json(200, {"ok": True, "data": self._recordings_list(context)})
+            self._send_json(200, {"ok": True, "data": self._recordings_list(context, query)})
             return
 
         if path == "/api/recordings/file":
@@ -694,11 +694,17 @@ class WebAdminHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ 录制回放
 
-    def _recordings_list(self, context: WebContext) -> list[dict[str, Any]]:
+    def _recordings_list(
+        self, context: WebContext, query: Optional[dict[str, list[str]]] = None
+    ) -> list[dict[str, Any]]:
         service = getattr(context, "recordings_service", None)
         if service is None:
             return []
-        return service.list_recordings()
+        # 默认走 TTL 缓存；用户主动点刷新时带 refresh=1 绕过缓存，立即看到新录制的文件
+        force = False
+        if query:
+            force = (query.get("refresh") or [""])[0].strip().lower() in ("1", "true", "yes")
+        return service.list_recordings(force=force)
 
     def _send_recording_file(self, context: WebContext, query: dict[str, list[str]]) -> None:
         service = getattr(context, "recordings_service", None)
@@ -715,23 +721,39 @@ class WebAdminHandler(BaseHTTPRequestHandler):
 
     def _send_file_range(self, file_path: str, content_type: str) -> None:
         """支持 HTTP Range 的静态文件流式响应，便于 <video> 拖拽与分段加载。"""
-        file_size = os.path.getsize(file_path)
+        try:
+            # 单次 stat 同时取大小与修改时间，避免重复系统调用
+            stat_result = os.stat(file_path)
+        except OSError as error:
+            raise WebServiceError("读取录制文件失败：{0}".format(error), 500, "file_read_failed") from error
+        file_size = stat_result.st_size
+        file_mtime = stat_result.st_mtime
+        # size + mtime 构成弱校验器：录制中的文件持续增长，仅凭 mtime 不足以标识版本
+        etag = '"{0:x}-{1:x}"'.format(int(file_mtime), file_size)
+
         range_header = (self.headers.get("Range") or "").strip()
         start, end = 0, file_size - 1
         partial = False
         if range_header:
             matched = re.match(r"bytes=(\d*)-(\d*)$", range_header)
             if matched:
-                begin, finish = matched.group(1), matched.group(2)
-                start = int(begin) if begin else 0
-                end = int(finish) if finish else file_size - 1
-                if start < 0 or end >= file_size or start > end:
-                    self.send_response(416)
-                    self.send_header("Content-Range", "bytes */{0}".format(file_size))
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                partial = True
+                # If-Range 校验器不匹配时按 RFC 7233 忽略本次 Range，回退为整体 200，
+                # 否则客户端会拿着针对旧版本文件的偏移在新文件上取到错位数据
+                if_range = (self.headers.get("If-Range") or "").strip()
+                range_valid = True
+                if if_range and if_range.strip('"') != etag.strip('"'):
+                    range_valid = False
+                if range_valid:
+                    begin, finish = matched.group(1), matched.group(2)
+                    start = int(begin) if begin else 0
+                    end = int(finish) if finish else file_size - 1
+                    if start < 0 or end >= file_size or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", "bytes */{0}".format(file_size))
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    partial = True
         length = end - start + 1
         if partial:
             self.send_response(206)
@@ -741,7 +763,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Last-Modified", email.utils.formatdate(os.path.getmtime(file_path), usegmt=True))
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", email.utils.formatdate(file_mtime, usegmt=True))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -850,7 +873,11 @@ def _resolve_downloads_dir(config_file: str, disk_path: Optional[str]) -> str:
     优先级：config.ini [录制设置] 直播保存路径(不填则默认) > 调用方注入的 disk_path
     （即默认 downloads）> <程序根目录>/downloads。相对路径按程序根目录解析。
     """
-    app_root = os.path.dirname(STATIC_DIR)  # web 包的父目录即程序根目录
+    # STATIC_DIR 形如 <程序根目录>/web/static，需连剥两层才是程序根目录：
+    # 第一层剥到 web 包本身，第二层才到根目录。只剥一层会导致 config.ini 中
+    # 的相对保存路径被解析成 <根目录>/web/downloads，与 Docker 挂载的
+    # /app/downloads 不符，回放列表将出现空白。
+    app_root = os.path.dirname(os.path.dirname(STATIC_DIR))
     save_path = _read_config_value(config_file, "录制设置", "直播保存路径(不填则默认)", "")
     if save_path:
         if not os.path.isabs(save_path):

@@ -66,6 +66,9 @@
     nowMeta.innerHTML = "正在播放：<b>" + escapeHtml(item.name) + "</b>";
     downloadBtn.href = videoUrl(item.path);
     downloadBtn.setAttribute("download", item.name);
+    if (item.recording) {
+      toast("该文件正在录制中，缺少完整索引，可能出现无法播放或拖动的情况");
+    }
     player.play().catch(function () { /* 自动播放被拦截时由用户手动点击 */ });
   }
 
@@ -91,7 +94,15 @@
         '<div class="pb-item-name"></div>' +
         '<div class="pb-item-sub"><span class="sz"></span><span class="mt"></span></div>' +
         '<div class="pb-item-path"></div>';
-      li.querySelector(".pb-item-name").textContent = item.name;
+      var nameBox = li.querySelector(".pb-item-name");
+      nameBox.textContent = item.name;
+      if (item.recording) {
+        var tag = document.createElement("span");
+        tag.className = "pb-tag-rec";
+        tag.textContent = "录制中";
+        tag.title = "该文件仍在写入，缺少完整索引，可能无法播放或拖动";
+        nameBox.appendChild(tag);
+      }
       li.querySelector(".sz").textContent = fmtSize(item.size);
       li.querySelector(".mt").textContent = item.mtime || "";
       li.querySelector(".pb-item-path").textContent = item.path;
@@ -100,9 +111,10 @@
     });
   }
 
-  function loadList() {
+  function loadList(force) {
     listMeta.textContent = "加载中…";
-    fetch("/api/recordings", { credentials: "same-origin" })
+    // force 为真时带 refresh=1，通知服务端绕过列表缓存立即重新扫描
+    fetch("/api/recordings" + (force ? "?refresh=1" : ""), { credentials: "same-origin" })
       .then(function (res) {
         if (res.status === 401) { location.href = "/login"; return null; }
         if (!res.ok) throw new Error("HTTP " + res.status);
@@ -131,18 +143,27 @@
     durTime.textContent = fmtTime(player.duration);
   });
 
+  // 拖拽进度条期间暂停 timeupdate 的回写同步。若不暂停，用户每拖动一次，
+  // timeupdate 就会用播放进度把滑块拽回原位，表现为「拖不动 / 自动回弹」。
+  var isSeeking = false;
+
   player.addEventListener("timeupdate", function () {
     curTime.textContent = fmtTime(player.currentTime);
-    if (player.duration) {
+    if (player.duration && !isSeeking) {
       progress.value = String(Math.floor((player.currentTime / player.duration) * 1000));
     }
   });
 
   progress.addEventListener("input", function () {
-    if (player.duration) {
-      player.currentTime = (Number(progress.value) / 1000) * player.duration;
-    }
+    if (!player.duration) return;
+    isSeeking = true;
+    player.currentTime = (Number(progress.value) / 1000) * player.duration;
   });
+
+  // change 在拖动/键盘操作结束时触发，seeked 在真正完成寻址时触发，两者兼顾
+  // 鼠标与键盘场景，避免在寻址完成前就恢复同步造成抖动。
+  progress.addEventListener("change", function () { isSeeking = false; });
+  player.addEventListener("seeked", function () { isSeeking = false; });
 
   volume.addEventListener("input", function () {
     player.volume = Number(volume.value) / 100;
@@ -167,7 +188,7 @@
     }
   });
 
-  refreshBtn.addEventListener("click", loadList);
+  refreshBtn.addEventListener("click", function () { loadList(true); });
 
   logoutBtn.addEventListener("click", function () {
     fetch("/api/logout", { method: "POST", credentials: "same-origin" })
