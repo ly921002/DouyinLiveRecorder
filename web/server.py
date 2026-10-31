@@ -653,6 +653,9 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/recordings/file":
+            if method == "DELETE":
+                self._delete_recording(context, query)
+                return
             self._require(method, ("GET", "HEAD"))
             self._send_recording_file(context, query)
             return
@@ -718,6 +721,20 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             raise
         except OSError as error:
             raise WebServiceError("读取录制文件失败：{0}".format(error), 500, "file_read_failed") from error
+
+    def _delete_recording(self, context: WebContext, query: dict[str, list[str]]) -> None:
+        """删除单个录制文件（DELETE /api/recordings/file?path=...）。
+
+        鉴权由 _dispatch 统一把关：非 PUBLIC_PATHS 的 /api/ 请求必须持有有效会话
+        Cookie（DLR_WEB_USER/PASSWORD 启用时），同源校验也已前置，天然防 CSRF。
+        路径合法性交由 service.resolve 校验，杜绝目录穿越。
+        """
+        service = getattr(context, "recordings_service", None)
+        if service is None:
+            raise WebServiceError("录制回放功能未启用", 503, "not_ready")
+        rel = (query.get("path") or [""])[0]
+        result = service.delete_recording(rel)
+        self._send_json(200, {"ok": True, "data": result, "message": "文件已删除"})
 
     def _send_file_range(self, file_path: str, content_type: str) -> None:
         """支持 HTTP Range 的静态文件流式响应，便于 <video> 拖拽与分段加载。"""

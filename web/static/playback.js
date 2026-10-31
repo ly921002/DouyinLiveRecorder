@@ -90,10 +90,14 @@
     items.forEach(function (item) {
       var li = document.createElement("li");
       li.className = "pb-item";
+      li._item = item;
       li.innerHTML =
-        '<div class="pb-item-name"></div>' +
-        '<div class="pb-item-sub"><span class="sz"></span><span class="mt"></span></div>' +
-        '<div class="pb-item-path"></div>';
+        '<div class="pb-item-main">' +
+          '<div class="pb-item-name"></div>' +
+          '<div class="pb-item-sub"><span class="sz"></span><span class="mt"></span></div>' +
+          '<div class="pb-item-path"></div>' +
+        '</div>' +
+        '<button class="pb-del" type="button" title="删除该文件">删除</button>';
       var nameBox = li.querySelector(".pb-item-name");
       nameBox.textContent = item.name;
       if (item.recording) {
@@ -107,8 +111,64 @@
       li.querySelector(".mt").textContent = item.mtime || "";
       li.querySelector(".pb-item-path").textContent = item.path;
       li.addEventListener("click", function () { selectItem(item, li); });
+      li.querySelector(".pb-del").addEventListener("click", function (e) {
+        // 阻止冒泡，避免触发列表项的「选中并播放」
+        e.stopPropagation();
+        deleteItem(item, li);
+      });
       listEl.appendChild(li);
     });
+  }
+
+  function deleteItem(item, node) {
+    // 正在写入的文件被 ffmpeg 占用，删除会导致录制任务报错或半文件，直接拦截
+    if (item.recording) {
+      toast("该文件正在录制中，无法删除，请先停止对应的录制任务");
+      return;
+    }
+    if (!window.confirm("确定要删除「" + item.name + "」吗？\n此操作不可恢复。")) {
+      return;
+    }
+    fetch("/api/recordings/file?path=" + encodeURIComponent(item.path), {
+      method: "DELETE",
+      credentials: "same-origin",
+    })
+      .then(function (res) {
+        if (res.status === 401) { location.href = "/login"; return null; }
+        if (res.status === 403) { toast("无权删除该文件（路径不合法）"); return null; }
+        if (res.status === 404) { toast("文件已被删除或不存在"); node.remove(); updateCountAfterDelete(); return null; }
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        if (!data) return;
+        if (!data.ok) throw new Error(data.error || "删除失败");
+        node.remove();
+        updateCountAfterDelete();
+        // 若正在播放的正是被删文件，重置播放器，避免指向已不存在的资源
+        if (current && current.path === item.path) {
+          player.pause();
+          player.removeAttribute("src");
+          player.load();
+          controls.hidden = true;
+          nowMeta.hidden = true;
+          current = null;
+        }
+        toast("已删除：" + item.name);
+      })
+      .catch(function (err) {
+        toast("删除失败：" + err.message);
+      });
+  }
+
+  function updateCountAfterDelete() {
+    var remaining = listEl.querySelectorAll(".pb-item").length;
+    if (remaining === 0) {
+      listEmpty.hidden = false;
+      listMeta.textContent = "没有找到 MP4 文件";
+      return;
+    }
+    listMeta.textContent = "共 " + remaining + " 个文件";
   }
 
   function loadList(force) {

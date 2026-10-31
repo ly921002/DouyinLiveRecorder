@@ -75,6 +75,9 @@ html, body {
 
 .pb-items { list-style: none; margin: 0; padding: 0 8px 16px; overflow-y: auto; flex: 1; }
 .pb-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 10px 12px;
   border-radius: 10px;
   cursor: pointer;
@@ -83,6 +86,19 @@ html, body {
 }
 .pb-item:hover { background: #eef1f8; }
 .pb-item.is-active { background: #e8ebfb; border-color: var(--primary); }
+.pb-item-main { flex: 1; min-width: 0; }
+.pb-del {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--recording);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.pb-del:hover { background: var(--recording); color: #fff; border-color: var(--recording); }
 .pb-item-name { font-size: 14px; font-weight: 600; word-break: break-all; }
 .pb-tag-rec {
   display: inline-block;

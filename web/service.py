@@ -1214,3 +1214,21 @@ class RecordingsService:
         if not os.path.isfile(target):
             raise WebServiceError("文件不存在", 404, "file_missing")
         return target
+
+    def delete_recording(self, rel_path: str) -> dict[str, Any]:
+        """删除单个录制文件，返回被删文件的路径与大小。
+
+        复用 resolve() 完成路径穿越防护与存在性校验；删除成功后立即失效 TTL
+        缓存，保证回放列表立刻反映删除结果，无需等待缓存过期。
+        """
+        target = self.resolve(rel_path)
+        try:
+            size = os.path.getsize(target)
+        except OSError:
+            size = 0
+        try:
+            os.remove(target)
+        except OSError as error:
+            raise WebServiceError("删除文件失败：{0}".format(error), 500, "delete_failed") from error
+        self._cache = None
+        return {"path": rel_path, "size": size, "deleted": True}
