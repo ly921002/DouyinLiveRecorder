@@ -31,6 +31,8 @@ import httpx
 from src import spider, stream
 from src.proxy import ProxyDetector
 from src.utils import logger
+from src.ip2free import Ip2FreeProxyPool, Ip2FreeSettings
+from src.ip2free_bridge import LocalHttpProxyBridge, StickyUpstreamPicker
 from src import utils
 from msg_push import (
     dingtalk, xizhi, tg_bot, send_email, bark, ntfy, pushplus
@@ -437,6 +439,10 @@ def cookie_check_worker() -> None:
             else:
                 use_proxy = options.get(read_local('录制设置', '是否使用代理ip(是/否)', '否'), False)
                 proxy_value = read_local('录制设置', '代理地址', '') if use_proxy else None
+                # ip2free 启用时 Cookie 检测也走动态代理，顺手验证代理是否真的能出网
+                dynamic_proxy = ip2free_acquire_proxy()
+                if dynamic_proxy:
+                    proxy_value = dynamic_proxy
 
                 results = cookie_checker.run_check(cookies, proxy_addr=proxy_value, timeout=timeout)
                 counter = cookie_checker.summarize(results)
@@ -519,10 +525,12 @@ def clear_record_info(record_name: str, record_url: str) -> None:
         color_obj.print_colored(f"[{record_name}]已经从录制列表中移除\n", color_obj.YELLOW)
 
 
-def direct_download_stream(source_url: str, save_path: str, record_name: str, live_url: str, platform: str) -> bool:
+def direct_download_stream(source_url: str, save_path: str, record_name: str, live_url: str, platform: str,
+                           proxy_addr: str | None = None) -> bool:
     try:
         with open(save_path, 'wb') as f:
-            client = httpx.Client(timeout=None)
+            client = httpx.Client(timeout=None, proxy=utils.handle_proxy_addr(proxy_addr)) \
+                if proxy_addr else httpx.Client(timeout=None)
 
             headers = {}
             header_params = get_record_headers(platform, live_url)
@@ -692,22 +700,24 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
             retry = 0
             record_quality_zh, record_url, anchor_name = url_data
             record_quality = get_quality_code(record_quality_zh)
-            proxy_address = proxy_addr
+            # ip2free 启用后，每轮从「实测可用」的代理里挑一条用，替换 config.ini 里的固定代理
+            pool_proxy = ip2free_acquire_proxy()
+            proxy_address = pool_proxy or proxy_addr
             platform = '未知平台'
             live_domain = '/'.join(record_url.split('/')[0:3])
 
-            if proxy_addr:
+            if proxy_address:
                 proxy_address = None
                 for platform in enable_proxy_platform_list:
                     if platform and platform.strip() in record_url:
-                        proxy_address = proxy_addr
+                        proxy_address = pool_proxy or proxy_addr
                         break
 
             if not proxy_address:
                 if extra_enable_proxy_platform_list:
                     for pt in extra_enable_proxy_platform_list:
                         if pt and pt.strip() in record_url:
-                            proxy_address = proxy_addr_bak or None
+                            proxy_address = pool_proxy or proxy_addr_bak or None
 
             # 代理实时自检：本线程首次进入、或尚未通过检测时探一次；不可用则禁用代理改直连重试。
             # 已通过检测的线程不再反复探测；未通过的线程按 60s 冷却重试，实现自愈且不刷屏。
@@ -720,6 +730,19 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                         p_ok, p_msg = asyncio.run(utils.check_proxy_available(proxy_address))
                     except Exception as e:
                         p_ok, p_msg = False, f"{type(e).__name__}: {e}"
+                    # 动态代理失效时先剔除这条，再随机换一条复测，避免整条线程被迫直连
+                    if not p_ok and ip2free_pool is not None:
+                        ip2free_pool.mark_failed(proxy_address)
+                        retry_proxy = ip2free_acquire_proxy(exclude=proxy_address)
+                        if retry_proxy:
+                            proxy_address = retry_proxy
+                            try:
+                                p_ok, p_msg = asyncio.run(utils.check_proxy_available(proxy_address))
+                            except Exception as e:
+                                p_ok, p_msg = False, f"{type(e).__name__}: {e}"
+                            if p_ok:
+                                logger.info(f"{record_url} 已切换到 ip2free 代理 {proxy_address} 重试")
+                                p_msg = f"{p_msg}（已切换）"
                     _thread_local.proxy_checked = True
                     _thread_local.proxy_checked_at = time.time()
                     _thread_local.proxy_ok = p_ok
@@ -1357,8 +1380,10 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                     ffmpeg_command.insert(12, headers)
 
                                 if proxy_address:
+                                    # ffmpeg 的 http 协议不支持 socks5，ip2free 场景下改走本地桥接
+                                    ffmpeg_proxy = ip2free_ffmpeg_proxy(proxy_address)
                                     ffmpeg_command.insert(1, "-http_proxy")
-                                    ffmpeg_command.insert(2, proxy_address)
+                                    ffmpeg_command.insert(2, ffmpeg_proxy)
 
                                 recording.add(record_name)
                                 start_record_time = datetime.datetime.now()
@@ -1485,7 +1510,8 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             recording_time_list[record_name] = [start_record_time, record_quality_zh]
 
                                             download_success = direct_download_stream(
-                                                flv_url, save_file_path, record_name, record_url, platform
+                                                flv_url, save_file_path, record_name, record_url, platform,
+                                                proxy_addr=proxy_address
                                             )
 
                                             if download_success:
@@ -1947,6 +1973,117 @@ def _parse_web_switch(value: Any, default: bool) -> bool:
     return default
 
 
+# --------------------------ip2free 动态 socks5 代理-------------------------------------
+IP2FREE_STATE_DIR = '.ip2free'
+ip2free_pool = None
+ip2free_bridge = None
+ip2free_settings = None
+ip2free_settings_signature = None
+
+
+def _stop_ip2free() -> None:
+    """销毁代理池并停止本地桥接（配置变更或关闭动态代理时调用）。"""
+    global ip2free_pool, ip2free_bridge
+    bridge, ip2free_bridge = ip2free_bridge, None
+    if bridge is not None:
+        try:
+            bridge.stop()
+        except Exception:
+            pass
+    pool, ip2free_pool = ip2free_pool, None
+    if pool is not None:
+        try:
+            pool.close()
+        except Exception:
+            pass
+
+
+def read_ip2free_settings():
+    """读取 ip2free 代理池配置（环境变量优先，其次 config.ini）。"""
+    return Ip2FreeSettings.from_reader(
+        lambda section, option, default: read_config_value(config, section, option, default)
+    )
+
+
+def setup_ip2free_pool(settings):
+    """创建代理池、启动本地 HTTP 桥接并完成首次挑选；失败返回 (None, None)。"""
+    global ip2free_pool, ip2free_bridge
+    if not settings.enabled:
+        return None, None
+    if not settings.has_credentials:
+        color_obj.print_colored(
+            "INFO：已开启 ip2free 动态代理，但未配置账号密码（config.ini 的 ip2free账号/ip2free密码，"
+            "或环境变量 IP2FREE_EMAIL / IP2FREE_PASSWORD），本项跳过",
+            color_obj.YELLOW
+        )
+        return None, None
+
+    state_dir = Path(script_path) / IP2FREE_STATE_DIR
+    pool = Ip2FreeProxyPool(
+        settings,
+        state_dir=state_dir,
+        offline_conf=state_dir / 'proxychains.conf',
+    )
+    try:
+        current = pool.bootstrap()
+    except Exception as err:
+        logger.warning(f"ip2free 代理池初始化异常: {type(err).__name__}: {err}")
+        current = None
+
+    if not current:
+        color_obj.print_colored(
+            f"INFO：ip2free 暂未挑选到可用 socks5 代理，本轮仍按原代理配置运行：{pool.last_error or '无可用代理'}",
+            color_obj.YELLOW
+        )
+        return None, None
+
+    ip2free_pool = pool
+    # ffmpeg 的 http 协议只认 HTTP 代理，这里用本地桥接把流量转给 socks5；
+    # 粘性选择保证同一路直播的分片请求始终走同一条代理。
+    picker = StickyUpstreamPicker(lambda: ip2free_pool.pick_fast() if ip2free_pool else None)
+    bridge = LocalHttpProxyBridge(picker)
+    try:
+        bridge.start()
+    except OSError as err:
+        logger.warning(f"本地代理桥接启动失败: {err}，将为 ffmpeg 直接使用 socks5 地址")
+        bridge = None
+
+    ip2free_bridge = bridge
+    return pool, bridge
+
+
+def ip2free_acquire_proxy(exclude: str | None = None):
+    """为一次网络请求从实测可用的代理里挑一条，返回 socks5h 连接串。"""
+    if ip2free_pool is None:
+        return None
+    banned = [exclude] if exclude else None
+    entry = ip2free_pool.pick(exclude=banned)
+    return entry.url if entry else None
+
+
+def ip2free_proxy_addr():
+    """当前应使用的代理地址（httpx 用 socks5h 连接串）；未启用或代理池为空时返回 None。"""
+    if ip2free_pool is None:
+        return None
+    current = ip2free_pool.current
+    return current.url if current else None
+
+
+def ip2free_ffmpeg_proxy(proxy_value: str | None):
+    """把 httpx 用的 socks5 地址转换成 ffmpeg 可用的 -http_proxy 参数。
+
+    FFmpeg 的 http 协议只支持 HTTP 代理，因此优先返回本地桥接地址；
+    桥接不可用时退回原始地址（要求 ffmpeg 支持 socks，否则该条录制失败）。
+    """
+    if not proxy_value:
+        return None
+    url = str(proxy_value).strip()
+    if '@' in url or url.lower().startswith('socks'):
+        if ip2free_bridge is not None:
+            return ip2free_bridge.url
+    return url
+
+
 def get_web_runtime_snapshot() -> dict[str, Any]:
     """返回供 Web 管理界面展示的运行时快照。
 
@@ -1989,6 +2126,24 @@ def get_web_runtime_snapshot() -> dict[str, Any]:
         'max_request': globals().get('max_request', 0),
         'error_count': error_count,
         'exit_recording': bool(exit_recording),
+        # 只暴露代理池规模和本次使用的代理，不含账号密码
+        'ip2free': ip2free_snapshot(),
+    }
+
+
+def ip2free_snapshot() -> dict[str, Any]:
+    """ip2free 代理池的脱敏运行时快照。"""
+    if ip2free_pool is None:
+        return {'enabled': False, 'proxy_count': 0, 'current': '', 'last_error': ''}
+    current = ip2free_pool.current
+    return {
+        'enabled': True,
+        'proxy_count': len(ip2free_pool.proxies),
+        'current': current.masked() if current else '',
+        'latency_ms': current.latency_ms if current else 0,
+        'last_error': ip2free_pool.last_error,
+        'pick_mode': ip2free_pool.settings.pick_mode,
+        'updated_at': ip2free_pool.updated_at,
     }
 
 
@@ -2072,6 +2227,48 @@ while True:
     proxy_addr_bak = read_config_value(config, '录制设置', '代理地址', "")
     proxy_addr = None if not use_proxy else proxy_addr_bak
 
+    # ip2free 动态 socks5 代理：启用后每轮都会把 proxy_addr 覆盖为实测可用的代理，
+    # 本地没有可用代理时自动退回 config.ini 里的固定代理地址。
+    if not use_proxy:
+        if ip2free_pool is not None:
+            logger.info("ip2free 动态代理已关闭，销毁代理池并停止本地桥接")
+            _stop_ip2free()
+    else:
+        current_settings = read_ip2free_settings()
+        ip2free_settings = current_settings
+        if not current_settings.enabled:
+            if ip2free_pool is not None:
+                _stop_ip2free()
+        elif not current_settings.has_credentials:
+            color_obj.print_colored(
+                "INFO：已开启 ip2free 动态代理，但未配置账号密码（config.ini 的 ip2free账号/ip2free密码，"
+                "或环境变量 IP2FREE_EMAIL / IP2FREE_PASSWORD），本项跳过",
+                color_obj.YELLOW
+            )
+            if ip2free_pool is not None:
+                _stop_ip2free()
+        else:
+            if ip2free_pool is None or ip2free_settings_signature != current_settings.signature():
+                _stop_ip2free()
+                pool, bridge = setup_ip2free_pool(current_settings)
+                ip2free_settings_signature = current_settings.signature()
+                if pool is not None:
+                    logger.info(
+                        f"ip2free 动态代理已启用（{pool.status_line()}）"
+                        + (f"，ffmpeg 桥接 {bridge.url}" if bridge is not None else "，无本地桥接")
+                    )
+            if ip2free_pool is not None:
+                # 后台按刷新间隔更新代理池，不阻塞录制循环
+                try:
+                    ip2free_pool.ensure_fresh(background=True)
+                except Exception as e:
+                    logger.warning(f"ip2free 代理池刷新异常: {type(e).__name__}: {e}")
+
+            # 每轮随机挑一条可用代理做本轮自检；录制线程各自再挑自己的
+            dynamic_proxy = ip2free_acquire_proxy()
+            if dynamic_proxy:
+                proxy_addr = dynamic_proxy
+
     # 代理可用性自检：启动时探一次外网连通性，代理失效尽早暴露（避免海外平台跑半天才发现全挂）
     # 尊重「是否跳过代理检测」开关：用户关掉代理检测时连新自检也跳过
     if proxy_addr and not skip_proxy_check:
@@ -2080,8 +2277,19 @@ while True:
             if proxy_ok:
                 logger.info(f"代理检测: 正常 - {proxy_msg} ({proxy_addr})")
             else:
-                logger.warning(f"代理检测: 不可用 - {proxy_msg} ({proxy_addr})，将自动禁用代理改直连重试")
-                proxy_addr = None
+                logger.warning(f"代理检测: 不可用 - {proxy_msg} ({proxy_addr})")
+                if ip2free_pool is not None:
+                    # 动态代理：剔除这条再随机换一条复测，避免直接把海外录制关闭
+                    ip2free_pool.mark_failed(proxy_addr)
+                    retry_proxy = ip2free_acquire_proxy(exclude=proxy_addr)
+                    if retry_proxy:
+                        proxy_addr = retry_proxy
+                        proxy_ok, proxy_msg = asyncio.run(utils.check_proxy_available(proxy_addr))
+                        if proxy_ok:
+                            logger.info(f"ip2free 切换代理后检测: 正常 - {proxy_msg} ({proxy_addr})")
+                if not proxy_ok:
+                    logger.warning("将自动禁用代理改直连重试")
+                    proxy_addr = None
         except Exception as e:
             logger.warning(f"代理检测: 执行异常 - {type(e).__name__}: {e}，将自动禁用代理改直连重试")
             proxy_addr = None

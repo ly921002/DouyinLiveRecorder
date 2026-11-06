@@ -20,6 +20,10 @@ services:
       # uv 是静态二进制，proxychains 的 LD_PRELOAD 对它无效
       # - HTTPS_PROXY=http://172.17.0.1:7890
       # - HTTP_PROXY=http://172.17.0.1:7890
+      # ip2free 动态 socks5 代理：账号密码走环境变量，不写进镜像和 git。
+      # 启用前把 config/config.ini 的「是否使用代理ip」「是否使用ip2free动态socks5代理」都设为「是」
+      # - IP2FREE_EMAIL=your@email.com
+      # - IP2FREE_PASSWORD=your-password
     extra_hosts:
       # 容器内可用 host.docker.internal 指代宿主机
       - "host.docker.internal:host-gateway"

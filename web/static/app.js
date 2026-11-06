@@ -707,8 +707,8 @@
       wrap.appendChild(input);
     } else {
       input = el("input", "input");
-      // 代理地址含账号密码，使用 password 类型避免明文泄露；其余字符串仍用文本框
-      input.type = meta.option === "代理地址"
+      // 代理地址、ip2free 账号密码含敏感信息，使用 password 类型避免明文泄露；其余字符串仍用文本框
+      input.type = (meta.option === "代理地址" || meta.option === "ip2free账号" || meta.option === "ip2free密码")
         ? "password"
         : (meta.type === "string" ? "text" : "number");
       input.value = meta.value === null || meta.value === undefined ? "" : String(meta.value);

@@ -1,0 +1,136 @@
+name: Build ip2free proxy image
+
+# 专供「ip2free 动态 socks5 代理」分支使用：
+# 触发条件收窄到本分支 push / 手动触发，避免和上游的 build-image.yml 重复构建。
+on:
+  push:
+    branches: ['feat/ip2free-socks5-proxy']
+    paths-ignore:
+      - '**.md'
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: '额外镜像标签（例如 ip2free-v1），留空只打分支名与 sha'
+        required: false
+        default: ''
+      platforms:
+        description: 'Target platforms'
+        required: false
+        default: 'linux/amd64'
+      push_image:
+        description: 'Push image to registry'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  IMAGE_NAME: douyin-live-recorder
+  # 分支专属标签前缀，方便和上游 latest 区分
+  TAG_PREFIX: ip2free
+
+jobs:
+  build:
+    name: Build proxy image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare build parameters
+        id: prep
+        env:
+          INPUT_PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          INPUT_PUSH_IMAGE: ${{ github.event.inputs.push_image }}
+        run: |
+          set -eu
+          owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "images=ghcr.io/${owner_lc}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "platforms=${INPUT_PLATFORMS}" >> "$GITHUB_OUTPUT"
+          if [ "${INPUT_PUSH_IMAGE:-}" = "false" ]; then
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU (multi-arch)
+        if: steps.prep.outputs.platforms != 'linux/amd64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.prep.outputs.images }}
+          tags: |
+            type=ref,event=branch,prefix=${{ env.TAG_PREFIX }}-
+            type=raw,value=${{ env.TAG_PREFIX }}-latest
+            type=raw,value=${{ github.event.inputs.tag_suffix }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_suffix != '' }}
+            type=sha,format=short,prefix=${{ env.TAG_PREFIX }}-sha-
+
+      - name: Log in to GitHub Container Registry
+        if: steps.prep.outputs.should_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ steps.prep.outputs.platforms }}
+          push: ${{ steps.prep.outputs.should_push == 'true' }}
+          load: ${{ steps.prep.outputs.should_push == 'false' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: ${{ steps.prep.outputs.should_push == 'true' && 'type=gha,mode=max' || '' }}
+
+      # ip2free 版本的额外冒烟测试：模块可导入、socks5 依赖在、导出函数可用
+      - name: Smoke test (ip2free proxy modules)
+        if: steps.prep.outputs.should_push == 'false'
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          set -eu
+          echo "== image: $IMAGE"
+          docker run --rm --entrypoint uv "$IMAGE" run python -c \
+            "from src.ip2free import Ip2FreeProxyPool, Ip2FreeSettings, select_working; from src.ip2free_bridge import LocalHttpProxyBridge, StickyUpstreamPicker; print('ip2free modules OK')"
+          docker run --rm --entrypoint uv "$IMAGE" run python -c \
+            "import httpx_socks, socksio; print('socks5 transport OK')"
+          # 离线单测：不联网，验证测速筛选与桥接逻辑
+          docker run --rm --workdir /app --entrypoint uv "$IMAGE" run python -m unittest tests.test_ip2free tests.test_ip2free_bridge
+
+      # 推送场景下也跑一遍只读校验（不重复跑单测，节省时间）
+      - name: Verify pushed image modules
+        if: steps.prep.outputs.should_push == 'true'
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          set -eu
+          docker pull "$IMAGE"
+          docker run --rm --entrypoint uv "$IMAGE" run python -c \
+            "from src.ip2free import Ip2FreeProxyPool; from src.ip2free_bridge import LocalHttpProxyBridge; print('ip2free modules OK')"
+
+      - name: Image summary
+        if: always()
+        run: |
+          echo "### ip2free proxy image build" >> "$GITHUB_STEP_SUMMARY"
+          echo "- platforms: ${{ steps.prep.outputs.platforms }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- pushed: ${{ steps.prep.outputs.should_push }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tags: ${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

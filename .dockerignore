@@ -16,6 +16,8 @@ env
 logs
 downloads
 backup_config
+# ip2free 代理池状态（含登录 token、代理账号密码），绝不进镜像
+.ip2free
 *.mp4
 *.flv
 *.ts
