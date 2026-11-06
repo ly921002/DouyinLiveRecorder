@@ -628,6 +628,40 @@ docker-compose stop
 
 &emsp;
 
+5.带 ip2free 动态代理的镜像
+
+`feat/ip2free-socks5-proxy` 分支由独立工作流 `.github/workflows/build-ip2free-image.yml` 构建，
+镜像标签带 `ip2free-` 前缀，和 main 分支的 `latest` 互不覆盖：
+
+```bash
+# 最新代理版本
+docker pull ghcr.io/ly921002/douyin-live-recorder:ip2free-latest
+# 或按分支 / 提交精确锁定
+docker pull ghcr.io/ly921002/douyin-live-recorder:ip2free-feat-ip2free-socks5-proxy
+docker pull ghcr.io/ly921002/douyin-live-recorder:ip2free-sha-2d60e24
+```
+
+`docker-compose.yaml` 已默认指向 `ip2free-latest`。ip2free 账号密码通过环境变量注入，不要写进配置文件：
+
+```yaml
+    environment:
+      - IP2FREE_EMAIL=your@email.com
+      - IP2FREE_PASSWORD=your-password
+```
+
+三个可用标签：
+
+| 标签 | 说明 |
+| --- | --- |
+| `ip2free-latest` | 代理分支的最新构建 |
+| `ip2free-feat-ip2free-socks5-proxy` | 跟随分支名的标签 |
+| `ip2free-sha-<commit>` | 按提交锁定，便于复现问题 |
+
+镜像构建后会额外校验：`src.ip2free` / `src.ip2free_bridge` 可导入、`httpx_socks` 与 `socksio`
+socks5 传输可用、以及 43 个离线单测（假 socks5 服务端，不联网）。
+
+&emsp;
+
 ## 🤖相关项目
 
 - StreamCap: https://github.com/ihmily/StreamCap

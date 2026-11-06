@@ -2,7 +2,9 @@ services:
   app:
     # 用自己 Action 构建的镜像（含 proxychains4 / uv / node / ffmpeg / web 管理界面）。
     # 上游官方镜像 ihmily/douyin-live-recorder 没有这些组件，不能直接用。
-    image: ghcr.io/ly921002/douyin-live-recorder:latest
+    # ip2free-latest = 带「自动挑选 ip2free socks5 代理」的分支构建（feat/ip2free-socks5-proxy）
+    # latest         = main 分支的上游同步版本
+    image: ghcr.io/ly921002/douyin-live-recorder:ip2free-latest
     # 若要在本机从源码构建，取消下一行注释并注释掉上面的 image
     # build: .
     command: uv run python main.py
