@@ -18,7 +18,8 @@ on:
       platforms:
         description: 'Target platforms'
         required: false
-        default: 'linux/amd64'
+        # 默认双架构：amd64 服务器 / arm64（Oracle 云 ARM、Apple Silicon、ARM NAS）都能直接跑
+        default: 'linux/amd64,linux/arm64'
       push_image:
         description: 'Push image to registry'
         required: false
@@ -46,22 +47,26 @@ jobs:
       - name: Prepare build parameters
         id: prep
         env:
-          INPUT_PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          INPUT_PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
           INPUT_PUSH_IMAGE: ${{ github.event.inputs.push_image }}
         run: |
           set -eu
           owner_lc="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           echo "images=ghcr.io/${owner_lc}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "platforms=${INPUT_PLATFORMS}" >> "$GITHUB_OUTPUT"
           if [ "${INPUT_PUSH_IMAGE:-}" = "false" ]; then
             echo "should_push=false" >> "$GITHUB_OUTPUT"
+            # load 到本地只能单架构，否则 buildx 会报 'docker exporter does not currently support exporting manifest lists'
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
           else
             echo "should_push=true" >> "$GITHUB_OUTPUT"
+            echo "platforms=${INPUT_PLATFORMS}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up QEMU (multi-arch)
         if: steps.prep.outputs.platforms != 'linux/amd64'
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -120,8 +125,22 @@ jobs:
         if: steps.prep.outputs.should_push == 'true'
         env:
           IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          INPUT_PLATFORMS: ${{ steps.prep.outputs.platforms }}
         run: |
           set -eu
+          # 显式校验多架构：只产出 amd64 时，arm64 宿主会报 exec format error，
+          # 这种错误必须在 CI 里拦住，而不是等用户部署时才发现。
+          echo "== manifest platforms"
+          docker buildx imagetools inspect "$IMAGE" | tee /tmp/manifest.txt
+          if echo "$INPUT_PLATFORMS" | grep -q 'linux/arm64'; then
+            grep -q 'linux/arm64' /tmp/manifest.txt || {
+              echo "::error::镜像清单缺少 linux/arm64"; exit 1; }
+          fi
+          if echo "$INPUT_PLATFORMS" | grep -q 'linux/amd64'; then
+            grep -q 'linux/amd64' /tmp/manifest.txt || {
+              echo "::error::镜像清单缺少 linux/amd64"; exit 1; }
+          fi
+          # 按宿主架构实际拉起一次，确认二进制可执行
           docker pull "$IMAGE"
           docker run --rm --entrypoint uv "$IMAGE" run python -c \
             "from src.ip2free import Ip2FreeProxyPool; from src.ip2free_bridge import LocalHttpProxyBridge; print('ip2free modules OK')"

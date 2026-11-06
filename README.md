@@ -657,6 +657,10 @@ docker pull ghcr.io/ly921002/douyin-live-recorder:ip2free-sha-2d60e24
 | `ip2free-feat-ip2free-socks5-proxy` | 跟随分支名的标签 |
 | `ip2free-sha-<commit>` | 按提交锁定，便于复现问题 |
 
+镜像为 **多架构**（`linux/amd64` + `linux/arm64`），Oracle 云 ARM / Apple Silicon / ARM NAS 可直接拉取，
+无需 `--platform` 指定。若某次构建只产出单架构，CI 会直接失败（`exec format error` 属于该类问题）：
+在宿主机执行 `uname -m`，`aarch64`/`arm64` 需要 arm64 镜像，`x86_64` 需要 amd64 镜像。
+
 镜像构建后会额外校验：`src.ip2free` / `src.ip2free_bridge` 可导入、`httpx_socks` 与 `socksio`
 socks5 传输可用、以及 43 个离线单测（假 socks5 服务端，不联网）。
 
