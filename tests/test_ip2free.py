@@ -31,6 +31,7 @@ ProxyEntry = ip2free.ProxyEntry
 Ip2FreeSettings = ip2free.Ip2FreeSettings
 Ip2FreeProxyPool = ip2free.Ip2FreeProxyPool
 ProbeResult = ip2free.ProbeResult
+BlockResult = ip2free.BlockResult
 
 
 def make_entry(ip, port=1080, latency=0, **kwargs):
@@ -241,7 +242,7 @@ class PoolTestCase(unittest.TestCase):
     def settings(self, value):
         self._settings = value
 
-    def build(self, client=None, entries=None, probe=None):
+    def build(self, client=None, entries=None, probe=None, block_probe=None):
         self.client = client or FakeClient(entries or [])
         self.now = getattr(self, "now", [1000.0])
         pool = Ip2FreeProxyPool(
@@ -249,6 +250,7 @@ class PoolTestCase(unittest.TestCase):
             state_dir=self.tmp.name,
             client_factory=lambda **kwargs: self.client,
             probe=probe or (lambda entry, url, timeout: ProbeResult(ok=True, latency_ms=10)),
+            block_probe=block_probe or (lambda entry, platforms, timeout: {}),
             clock=lambda: self.now[0],
         )
         self.pools.append(pool)
@@ -546,6 +548,195 @@ class PoolTestCase(unittest.TestCase):
         pool.close()
         self.assertIsNone(pool.current)
         self.assertIsNone(pool.rotate())
+
+
+class BlockProbeParseTestCase(unittest.TestCase):
+    """平台封禁探测配置解析。"""
+
+    def test_aliases_and_disable(self):
+        self.assertEqual(ip2free._parse_block_probes("pandatv"), ("pandatv",))
+        self.assertEqual(ip2free._parse_block_probes("PandaTV"), ("pandatv",))
+        self.assertEqual(ip2free._parse_block_probes("熊猫"), ("pandatv",))
+        self.assertEqual(ip2free._parse_block_probes("pandatv，熊猫"), ("pandatv",))
+        self.assertEqual(ip2free._parse_block_probes(""), ())
+        self.assertEqual(ip2free._parse_block_probes(None), ())
+        self.assertEqual(ip2free._parse_block_probes("unknown"), ())
+
+    def test_settings_reads_option(self):
+        values = {"ip2free平台封禁探测": "pandatv"}
+        settings = Ip2FreeSettings.from_reader(
+            lambda s, o, d: values.get(o, d), environ={}
+        )
+        self.assertEqual(settings.block_probes, ("pandatv",))
+
+    def test_settings_default_enables_panda(self):
+        settings = Ip2FreeSettings.from_reader(lambda s, o, d: d, environ={})
+        self.assertEqual(settings.block_probes, (ip2free.DEFAULT_BLOCK_PROBES,))
+
+
+class FakeResponse:
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+
+class FakeClientCtx:
+    """模拟 httpx.Client 的上下文管理器，用于探测函数单测。"""
+
+    def __init__(self, response):
+        self._response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, *args, **kwargs):
+        return self._response
+
+    def get(self, *args, **kwargs):
+        return self._response
+
+
+class PandaBlockProbeTestCase(unittest.TestCase):
+    """PandaTV 封禁判定：优先结构化字段，网络异常不误判。"""
+
+    def probe(self, status_code, body):
+        factory = lambda url, timeout: FakeClientCtx(FakeResponse(status_code, body))
+        return ip2free.probe_pandatv_block("socks5h://u:p@1.1.1.1:1080",
+                                           timeout=5, client_factory=factory)
+
+    def test_detects_block_via_error_data_code(self):
+        body = ('{"result":false,"message":"\\uc81c\\uc7ac\\ub41c \\uc544\\uc774\\ud53c\\uc785\\ub2c8'
+                '\\ub2e4.","errorData":{"code":"block"},"userIp":"1.1.1.1"}')
+        result = self.probe(403, body)
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.platform, "pandatv")
+        self.assertIn("block", result.detail)
+
+    def test_detects_block_with_spaced_json(self):
+        body = '{"errorData": {"code": "block"}, "message": "blocked"}'
+        self.assertTrue(self.probe(403, body).blocked)
+
+    def test_detects_block_via_korean_text(self):
+        self.assertTrue(self.probe(403, '{"message":"제재된 아이피입니다."}').blocked)
+
+    def test_healthy_response_not_blocked(self):
+        body = '{"result":true,"PlayList":{"hls":[{"url":"https://x/y.m3u8"}]}}'
+        result = self.probe(200, body)
+        self.assertFalse(result.blocked)
+
+    def test_user_not_found_is_not_block(self):
+        body = '{"result":false,"message":"유저 정보가 없습니다.","userIp":"1.1.1.1"}'
+        self.assertFalse(self.probe(400, body).blocked)
+
+    def test_network_error_is_not_block(self):
+        def boom(url, timeout):
+            raise ConnectionError("timed out")
+
+        result = ip2free.probe_pandatv_block("socks5h://1.1.1.1:1080", 5, client_factory=boom)
+        self.assertFalse(result.blocked)
+        self.assertIn("ConnectionError", result.detail)
+
+
+class BlockFilteringTestCase(unittest.TestCase):
+    """被封禁的代理要和连不上一样被舍弃，并切换其他代理。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pools = []
+
+    def tearDown(self):
+        for pool in self.pools:
+            pool.wait_idle(timeout=10)
+
+    def build(self, entries, blocked_ips=(), settings=None):
+        settings = settings or Ip2FreeSettings(
+            enabled=True, email="a@b.c", password="p", max_pick=5
+        )
+
+        def block_probe(entry, platforms, timeout):
+            self.assertIn("pandatv", platforms)
+            if entry.ip in blocked_ips:
+                return {"pandatv": BlockResult(True, "pandatv", "HTTP 403 errorData.code=block")}
+            return {"pandatv": BlockResult(False, "pandatv", "HTTP 200")}
+
+        self.client = FakeClient(entries)
+        pool = Ip2FreeProxyPool(
+            settings,
+            state_dir=self.tmp.name,
+            client_factory=lambda **kwargs: self.client,
+            probe=lambda e, u, t: ProbeResult(ok=True, latency_ms=10),
+            block_probe=block_probe,
+            clock=lambda: 1000.0,
+        )
+        self.pools.append(pool)
+        return pool
+
+    def test_blocked_proxy_is_dropped_on_refresh(self):
+        entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
+        pool = self.build(entries, blocked_ips={"1.1.1.1"})
+        working = pool.refresh()
+        self.assertEqual([e.ip for e in working], ["2.2.2.2"])
+        self.assertEqual([e.ip for e in pool.proxies], ["2.2.2.2"])
+
+    def test_blocked_proxy_is_dropped_on_recheck(self):
+        entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
+        pool = self.build(entries, blocked_ips=set())
+        pool.refresh()
+        self.assertEqual(len(pool.proxies), 2)
+        # 第二次复检时 2.2.2.2 被封
+        pool._block_probe = lambda e, p, t: (
+            {"pandatv": BlockResult(True, "pandatv", "block")} if e.ip == "2.2.2.2"
+            else {"pandatv": BlockResult(False, "pandatv", "ok")}
+        )
+        alive = pool.recheck()
+        self.assertEqual([e.ip for e in alive], ["1.1.1.1"])
+
+    def test_pick_never_returns_blocked_proxy(self):
+        entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
+        pool = self.build(entries, blocked_ips={"1.1.1.1"})
+        pool.refresh()
+        for _ in range(30):
+            self.assertEqual(pool.pick().ip, "2.2.2.2")
+
+    def test_blocked_info_records_reason(self):
+        entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
+        pool = self.build(entries, blocked_ips={"1.1.1.1"})
+        pool.refresh()
+        info = pool.blocked_info()
+        self.assertIn("1.1.1.1:1080", info)
+        self.assertIn("pandatv", info["1.1.1.1:1080"])
+
+    def test_block_probe_disabled_keeps_proxy(self):
+        settings = Ip2FreeSettings(
+            enabled=True, email="a@b.c", password="p", max_pick=5, block_probes=()
+        )
+        entries = [make_entry("1.1.1.1")]
+        pool = self.build(entries, blocked_ips={"1.1.1.1"}, settings=settings)
+        self.assertEqual([e.ip for e in pool.refresh()], ["1.1.1.1"])
+
+    def test_block_probe_exception_does_not_drop_proxy(self):
+        """探测本身异常时按未封禁处理，避免误杀。"""
+        def broken(entry, platforms, timeout):
+            raise RuntimeError("probe crashed")
+
+        entries = [make_entry("1.1.1.1")]
+        settings = Ip2FreeSettings(enabled=True, email="a@b.c", password="p", max_pick=5)
+        pool = Ip2FreeProxyPool(
+            settings, state_dir=self.tmp.name,
+            client_factory=lambda **kwargs: FakeClient(entries),
+            probe=lambda e, u, t: ProbeResult(ok=True, latency_ms=10),
+            block_probe=broken, clock=lambda: 1000.0,
+        )
+        self.pools.append(pool)
+        # 让异常发生在封禁探测内部（模拟单一平台探测失败）
+        pool._block_probe = lambda e, p, t: ip2free.probe_platform_blocks(
+            e, p, 5, probe_funcs={"pandatv": lambda proxy, timeout: (_ for _ in ()).throw(RuntimeError("x"))}
+        )
+        self.assertEqual([e.ip for e in pool.refresh()], ["1.1.1.1"])
 
 
 if __name__ == "__main__":

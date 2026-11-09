@@ -1786,6 +1786,26 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
 
                                 count_time = time.time()
 
+                except utils.PlatformBlockedError as e:
+                    # 平台按出口 IP 封禁：舍弃这条代理并立刻换一条，而不是干等下一轮
+                    blocked_proxy = proxy_address
+                    logger.warning(
+                        f"{record_url} 代理出口被 {e.platform} 封禁（{e.detail or 'block'}）"
+                        f"，已舍弃该代理并切换重试"
+                    )
+                    if ip2free_pool is not None and blocked_proxy:
+                        ip2free_pool.mark_failed(blocked_proxy)
+                        retry_proxy = ip2free_acquire_proxy(exclude=blocked_proxy)
+                        if retry_proxy:
+                            proxy_address = retry_proxy
+                            _thread_local.proxy_ok = False
+                            _thread_local.proxy_checked_at = 0
+                            logger.info(f"{record_url} 已切换代理 {retry_proxy} 重试")
+                            continue
+                    with max_request_lock:
+                        error_count += 1
+                        error_window.append(1)
+
                 except Exception as e:
                     logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
                     with max_request_lock:

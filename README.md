@@ -264,6 +264,14 @@ ip2free测速地址 = https://www.gstatic.com/generate_204
 - **失效自动剔除并换一条**：代理自检或代理连接失败时，该代理会被移出可用池并立刻换一条重测；
   舍弃结果会同步写回 `.ip2free/proxy_cache.json`，重启后也不会把失效凭证读回来。
   池子被清空后会重新抓取 + 测速。
+- **平台封禁同样舍弃**：代理能出网不代表目标平台肯收——PandaTV 会按出口 IP 直接返回
+  `403 {"errorData":{"code":"block"}}`。这类代理在测速/复检阶段就会被识别并剔除，日志会打印
+  `ip2free 代理 x.x.x.x:port 被平台封禁（pandatv: HTTP 403 errorData.code=block），已舍弃并切换其他代理`。
+  录制过程中若平台临时封禁，会打出
+  `代理出口被 PandaTV 封禁（...），已舍弃该代理并切换重试` 并立即换一条代理重试。
+  判定只认结构化字段 `errorData.code=block`（韩文/英文关键词兜底），
+  **网络异常一律不判为封禁**，避免平台抖动误杀可用代理。可用 `ip2free平台封禁探测 = pandatv`
+  控制（留空关闭）。
 - **ffmpeg 也走 socks5**：ffmpeg 的 `http` 协议只支持 HTTP 代理，程序会在 `127.0.0.1` 上起一个本地桥接，
   把 `-http_proxy` 的流量转给当前 socks5 代理，因此录像同样走代理出口。
 - **状态落盘**：工程目录 `.ip2free/` 下保存 `token.txt`（登录 token）、`proxy_cache.json`（可用代理与延迟）、

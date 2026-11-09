@@ -23,6 +23,7 @@ import ipaddress
 import json
 import os
 import random
+import re
 import socket
 import threading
 import time
@@ -63,6 +64,20 @@ PICK_MODE_RANDOM = "随机"
 PICK_MODE_FASTEST = "最快"
 PICK_MODES = (PICK_MODE_RANDOM, PICK_MODE_FASTEST)
 
+#: 平台封禁探测：代理本身能出网，但目标平台按出口 IP 封禁时也要舍弃
+DEFAULT_BLOCK_PROBES = "pandatv"
+BLOCK_PROBE_PANDA = "pandatv"
+BLOCK_PROBES = (BLOCK_PROBE_PANDA,)
+
+#: 平台封禁判定关键词（结构化字段优先，文本兜底；对韩文/英文字样都覆盖）
+PANDA_BLOCK_MARKERS = (
+    '"code": "block"',
+    '"code":"block"',
+    "제재된 아이피",          # 该 IP 已被制裁
+    "blocked ip",
+    "banned ip",
+)
+
 #: config.ini 中与 ip2free 相关的配置项及其默认值
 CONFIG_KEYS: dict[str, str] = {
     "enabled": "是否使用ip2free动态socks5代理(是/否)",
@@ -77,6 +92,7 @@ CONFIG_KEYS: dict[str, str] = {
     "test_url": "ip2free测速地址",
     "pick_mode": "ip2free代理选择方式",
     "recheck_minutes": "ip2free代理复检间隔(分钟)",
+    "block_probes": "ip2free平台封禁探测",
 }
 
 #: config.ini 缺失这些项时的默认值（会被 main.read_config_value 自动补写进配置文件）
@@ -93,6 +109,7 @@ CONFIG_DEFAULTS: dict[str, str] = {
     "test_url": DEFAULT_TEST_URL,
     "pick_mode": PICK_MODE_RANDOM,
     "recheck_minutes": "5",
+    "block_probes": DEFAULT_BLOCK_PROBES,
 }
 
 _TRUE_VALUES = {"是", "yes", "y", "true", "1", "on", "enable", "enabled"}
@@ -194,6 +211,7 @@ class Ip2FreeSettings:
     page_size: int = 50
     pick_mode: str = PICK_MODE_RANDOM
     recheck_minutes: int = 5
+    block_probes: tuple[str, ...] = (DEFAULT_BLOCK_PROBES,)
 
     @property
     def has_credentials(self) -> bool:
@@ -211,6 +229,7 @@ class Ip2FreeSettings:
             self.probe_timeout,
             self.test_url,
             self.pick_mode,
+            self.block_probes,
         )
 
     @classmethod
@@ -263,6 +282,7 @@ class Ip2FreeSettings:
             test_url=raw("test_url") or DEFAULT_TEST_URL,
             pick_mode=pick_mode,
             recheck_minutes=_to_int(raw("recheck_minutes"), 5, 1, 720),
+            block_probes=_parse_block_probes(raw("block_probes")),
         )
 
 
@@ -294,6 +314,28 @@ def _to_float(value: Any, default: float, minimum: float, maximum: float) -> flo
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, number))
+
+
+def _parse_block_probes(value: Any) -> tuple[str, ...]:
+    """解析「平台封禁探测」配置：逗号分隔，支持 pandatv / 熊猫 / 空值关闭。"""
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    aliases = {
+        "pandatv": BLOCK_PROBE_PANDA,
+        "panda": BLOCK_PROBE_PANDA,
+        "熊猫": BLOCK_PROBE_PANDA,
+        "熊猫tv": BLOCK_PROBE_PANDA,
+    }
+    probes: list[str] = []
+    for item in text.replace("，", ",").split(","):
+        key = item.strip().lower()
+        if not key:
+            continue
+        mapped = aliases.get(key, key)
+        if mapped in BLOCK_PROBES and mapped not in probes:
+            probes.append(mapped)
+    return tuple(probes)
 
 
 def normalize_proxies(
@@ -647,6 +689,93 @@ def probe_proxy(
         return ProbeResult(ok=False, latency_ms=latency, detail="{0}: {1}".format(type(exc).__name__, exc))
 
 
+@dataclass(frozen=True)
+class BlockResult:
+    """平台封禁探测结果。``blocked`` 只在**确认**被该平台封禁时为 True。"""
+
+    blocked: bool
+    platform: str = ""
+    detail: str = ""
+
+
+def probe_pandatv_block(
+    proxy: "ProxyEntry | str",
+    timeout: float = 10.0,
+    client_factory: Optional[Callable[[str, float], Any]] = None,
+) -> BlockResult:
+    """探测该出口 IP 是否被 PandaTV 封禁。
+
+    PandaTV 对封禁 IP 返回 HTTP 403 且响应体带 ``errorData.code = "block"``：
+
+        {"result":false,"message":"제재된 아이피입니다...","errorData":{"code":"block"}}
+
+    因此优先匹配结构化字段，文本关键词只作兜底。网络异常/超时一律**不判定为封禁**
+    （避免把平台抖动误判成封禁，白白丢掉可用代理）。
+    """
+    url = proxy.url if isinstance(proxy, ProxyEntry) else str(proxy)
+    factory = client_factory or _default_client_factory
+    headers = {
+        "origin": "https://www.pandalive.co.kr",
+        "referer": "https://www.pandalive.co.kr/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) "
+                      "Gecko/20100101 Firefox/124.0",
+    }
+    try:
+        with factory(url, timeout) as client:
+            response = client.post(
+                "https://api.pandalive.co.kr/v1/live/play",
+                headers=headers,
+                data={"action": "watch", "userId": "probe", "password": "", "shareLinkType": ""},
+            )
+    except Exception as exc:
+        return BlockResult(False, BLOCK_PROBE_PANDA, "{0}: {1}".format(type(exc).__name__, exc))
+
+    body = (getattr(response, "text", "") or "").lower()
+    code = getattr(response, "status_code", 0)
+    blocked = False
+    detail = "HTTP {0}".format(code)
+    # 结构化判定优先：PandaTV 封禁时固定返回 errorData.code = "block"
+    compact = re.sub(r"\s+", "", body)
+    if '"errordata"' in compact and '"code":"block"' in compact:
+        blocked = True
+        detail = "HTTP {0} errorData.code=block".format(code)
+    else:
+        for marker in PANDA_BLOCK_MARKERS:
+            if marker.lower() in body:
+                blocked = True
+                detail = "HTTP {0} 命中封禁关键字".format(code)
+                break
+    return BlockResult(blocked, BLOCK_PROBE_PANDA, detail)
+
+
+#: 平台 -> 封禁探测函数
+BLOCK_PROBE_FUNCS: dict[str, Callable[..., BlockResult]] = {
+    BLOCK_PROBE_PANDA: probe_pandatv_block,
+}
+
+
+def probe_platform_blocks(
+    proxy: "ProxyEntry | str",
+    platforms: Sequence[str] = (),
+    timeout: float = 10.0,
+    probe_funcs: Optional[dict[str, Callable[..., BlockResult]]] = None,
+) -> dict[str, BlockResult]:
+    """对一条代理依次做各平台的封禁探测，返回 平台->结果。"""
+    funcs = probe_funcs or BLOCK_PROBE_FUNCS
+    results: dict[str, BlockResult] = {}
+    for platform in platforms:
+        func = funcs.get(platform)
+        if func is None:
+            continue
+        try:
+            results[platform] = func(proxy, timeout)
+        except Exception as exc:
+            results[platform] = BlockResult(
+                False, platform, "{0}: {1}".format(type(exc).__name__, exc)
+            )
+    return results
+
+
 def select_working(
     proxies: Sequence[ProxyEntry],
     *,
@@ -708,6 +837,7 @@ class Ip2FreeProxyPool:
         offline_conf: str | Path | None = None,
         client_factory: Optional[Callable[..., Ip2FreeClient]] = None,
         probe: Optional[Callable[..., ProbeResult]] = None,
+        block_probe: Optional[Callable[..., dict[str, "BlockResult"]]] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.settings = settings
@@ -715,6 +845,7 @@ class Ip2FreeProxyPool:
         self.offline_conf = Path(offline_conf) if offline_conf else None
         self._client_factory = client_factory or (lambda **kwargs: Ip2FreeClient(**kwargs))
         self._probe = probe
+        self._block_probe = block_probe
         self._clock = clock
         self._lock = threading.RLock()
         self._refresh_lock = threading.Lock()
@@ -729,6 +860,8 @@ class Ip2FreeProxyPool:
         self._checked_keys: set[str] = set()
         self._rechecking = False
         self._background_threads: list[threading.Thread] = []
+        # 平台封禁记录：ip:port -> {platform: 说明}，用于日志展示与避免重复探测
+        self._blocked: dict[str, dict[str, str]] = {}
 
     # ---------------- 路径
 
@@ -868,6 +1001,55 @@ class Ip2FreeProxyPool:
 
     # ---------------- 刷新
 
+    def _filter_blocked(self, entries: Sequence[ProxyEntry]) -> list[ProxyEntry]:
+        """剔除被目标平台封禁的代理，并按需写日志。
+
+        代理能出网不代表目标平台肯收（PandaTV 会按出口 IP 直接 403 block），
+        这类代理必须和"连不上"一样被舍弃，否则会一直占用池子、反复录制失败。
+        """
+        platforms = self.settings.block_probes
+        if not platforms or not entries:
+            return list(entries)
+
+        probe_func = self._block_probe or probe_platform_blocks
+        workers = max(1, min(self.settings.max_workers, len(entries)))
+        kept: list[ProxyEntry] = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ip2free-block") as executor:
+            futures = {executor.submit(probe_func, entry, platforms, self.settings.probe_timeout): entry
+                       for entry in entries}
+            for future in as_completed(futures):
+                entry = futures[future]
+                try:
+                    results = future.result()
+                except Exception:
+                    # 探测本身异常：按"未封禁"处理，避免误杀可用代理
+                    kept.append(entry)
+                    continue
+                blocked_here = {p: r.detail for p, r in (results or {}).items() if r.blocked}
+                if not blocked_here:
+                    kept.append(entry)
+                    if entry.key in self._blocked:
+                        self._blocked.pop(entry.key, None)
+                    continue
+                with self._lock:
+                    self._blocked[entry.key] = blocked_here
+                logger.warning(
+                    "ip2free 代理 {0} 被平台封禁（{1}），已舍弃并切换其他代理".format(
+                        entry.key,
+                        "、".join("{0}: {1}".format(p, d) for p, d in blocked_here.items()),
+                    )
+                )
+
+        # 保持入参顺序，便于调用方观察
+        order = {entry.key: index for index, entry in enumerate(entries)}
+        kept.sort(key=lambda item: order.get(item.key, 0))
+        return kept
+
+    def blocked_info(self) -> dict[str, dict[str, str]]:
+        """当前被判定的平台封禁记录（ip:port -> {平台: 说明}），供日志/状态展示。"""
+        with self._lock:
+            return {key: dict(value) for key, value in self._blocked.items()}
+
     def _probe_many(self, entries: Sequence[ProxyEntry], label: str) -> list[ProxyEntry]:
         """并发实测一组代理，返回仍可用（带实测延迟）的条目。"""
         if not entries:
@@ -890,7 +1072,8 @@ class Ip2FreeProxyPool:
                     continue
                 if result.ok:
                     alive.append(replace(entry, latency_ms=result.latency_ms))
-        return alive
+        # 能出网但被目标平台封禁的，等同于不可用：一并舍弃并记日志
+        return self._filter_blocked(alive)
 
     def _merge_with_sticky_credentials(
         self, fetched: list[ProxyEntry]

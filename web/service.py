@@ -635,6 +635,8 @@ CONFIG_FIELD_SCHEMA: tuple[dict[str, Any], ...] = (
     _field("ip2free测速地址", "ip2free 测速地址", "string",
            "经代理访问的连通性测试地址，返回码小于 500 即视为可用",
            "https://www.gstatic.com/generate_204"),
+    _field("ip2free平台封禁探测", "ip2free 平台封禁探测", "string",
+           "代理能出网但被平台按 IP 封禁时同样舍弃并切换；填 pandatv，留空关闭", "pandatv"),
 )
 
 CONFIG_WHITELIST: dict[str, dict[str, Any]] = {

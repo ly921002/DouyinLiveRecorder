@@ -35,6 +35,25 @@ class Color:
         print(f"{color}{text}{Color.RESET}")
 
 
+class PlatformBlockedError(ConnectionError):
+    """代理出口 IP 被目标平台封禁（平台按 IP 拒绝服务）。
+
+    与"网络不通"区分开：代理本身是好的，只是这个平台不收这个出口 IP，
+    因此需要**切换代理**而不是直接放弃录制。
+    """
+
+    def __init__(self, platform: str, detail: str = "", url: str = "") -> None:
+        self.platform = platform
+        self.detail = detail
+        self.url = url
+        message = f"{platform} 已封禁该代理出口 IP"
+        if detail:
+            message += f"（{detail}）"
+        if url:
+            message += f"，直播间: {url}"
+        super().__init__(message)
+
+
 def trace_error_decorator(func: callable) -> callable:
     @functools.wraps(func)
     def wrapper(*args: list, **kwargs: dict) -> Any:
@@ -42,6 +61,10 @@ def trace_error_decorator(func: callable) -> callable:
             return func(*args, **kwargs)
         except execjs.ProgramError:
             logger.warning('Failed to execute JS code. Please check if the Node.js environment')
+        except PlatformBlockedError as e:
+            # 平台封禁需要上层切换代理，不能被当成普通错误吞掉
+            logger.warning(f"平台封禁: {e}")
+            raise
         except Exception as e:
             error_line = traceback.extract_tb(e.__traceback__)[-1].lineno
             error_info = f"message: type: {type(e).__name__}, {str(e)} in function {func.__name__} at line: {error_line}"

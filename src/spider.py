@@ -1278,7 +1278,13 @@ async def get_pandatv_stream_data(url: str, proxy_addr: OptionalStr = None, cook
                        proxy_addr=proxy_addr, headers=headers, data=data, abroad=True)
     json_data = json.loads(json_str)
     if "bjInfo" not in json_data:
-        raise RuntimeError(json_data.get("message", 'Unknown error'))
+        message = str(json_data.get("message", "Unknown error"))
+        # 封禁时 member/bj 也可能直接返回 errorData.code = block
+        if str((json_data.get("errorData") or {}).get("code", "")) == "block" or "제재된 아이피" in message:
+            raise utils.PlatformBlockedError(
+                'PandaTV', detail=message.replace('\n', ' ').strip() or 'errorData.code=block', url=url
+            )
+        raise RuntimeError(message)
     anchor_id = json_data['bjInfo']['id']
     anchor_name = f"{json_data['bjInfo']['nick']}-{anchor_id}"
     result['anchor_name'] = anchor_name
@@ -1288,7 +1294,15 @@ async def get_pandatv_stream_data(url: str, proxy_addr: OptionalStr = None, cook
         json_str = await async_req(url2, proxy_addr=proxy_addr, headers=headers, data=data2, abroad=True)
         json_data = json.loads(json_str)
         if 'errorData' in json_data:
-            if json_data['errorData']['code'] == 'needAdult':
+            error_code = str(json_data['errorData'].get('code', ''))
+            if error_code == 'block':
+                # 平台按出口 IP 封禁：代理本身可用，必须换一条代理重试
+                raise utils.PlatformBlockedError(
+                    'PandaTV',
+                    detail=json_data.get('message', '').replace('\n', ' ').strip() or 'errorData.code=block',
+                    url=url,
+                )
+            if error_code == 'needAdult':
                 raise RuntimeError(f"{url} The live room requires login and is only accessible to adults. Please "
                                    f"correctly fill in the login cookie in the configuration file.")
             else:
