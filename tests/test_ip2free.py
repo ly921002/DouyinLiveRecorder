@@ -327,13 +327,24 @@ class PoolTestCase(unittest.TestCase):
         self.assertEqual([e.ip for e in alive], ["1.1.1.1"])
         self.assertEqual([e.ip for e in pool.proxies], ["1.1.1.1"])
 
-    def test_refresh_failure_keeps_previous_pool(self):
-        pool = self.build(entries=[make_entry("1.1.1.1")])
+    def test_refresh_api_failure_keeps_working_old_credentials(self):
+        """接口挂了但旧凭证仍可用时，旧凭证必须继续生效（旧行为会返回空）。"""
+        pool = self.build(entries=[make_entry("1.1.1.1", username="old", password="oldpw")])
         pool.refresh()
         self.client.error = RuntimeError("接口挂了")
-        self.assertEqual(pool.refresh(), [])
-        self.assertEqual(pool.current.ip, "1.1.1.1")  # 旧缓存保留
+        working = pool.refresh()
+        self.assertEqual([e.ip for e in working], ["1.1.1.1"])
+        self.assertEqual(pool.current.username, "old")  # 旧凭证未被清掉
         self.assertIn("接口挂了", pool.last_error)
+
+    def test_refresh_drops_dead_old_credentials_when_api_fails(self):
+        """接口挂了且旧凭证也实测失效时，明确舍弃，不留死凭证在池里。"""
+        pool = self.build(entries=[make_entry("1.1.1.1", username="old")])
+        pool.refresh()
+        self.client.error = RuntimeError("接口挂了")
+        pool._probe = lambda entry, url, timeout: ProbeResult(ok=False)
+        self.assertEqual(pool.refresh(), [])
+        self.assertEqual(pool.proxies, [])
 
     def test_offline_fallback_reads_proxychains(self):
         conf = os.path.join(self.tmp.name, "offline.conf")
@@ -380,6 +391,135 @@ class PoolTestCase(unittest.TestCase):
         self.assertFalse(pool.needs_recheck())
         self.now[0] += self.settings.recheck_minutes * 60 + 1
         self.assertTrue(pool.needs_recheck())
+
+    # ---------------- 凭证粘性 ----------------
+
+    def test_refresh_keeps_working_old_credentials_over_new(self):
+        """接口换了同节点账号密码，但旧凭证仍可用 -> 必须继续用旧的。"""
+        old = make_entry("1.1.1.1", 1080, username="olduser", password="oldpass")
+        new = make_entry("1.1.1.1", 1080, username="newuser", password="newpass")
+        pool = self.build(entries=[old])
+        pool.refresh()
+        self.assertEqual(pool.proxies[0].username, "olduser")
+
+        self.client.entries = [new]
+        # 探测只认旧凭证；若实现误用了新凭证就会直接测速失败
+        pool._probe = lambda entry, url, timeout: ProbeResult(
+            ok=entry.username == "olduser", latency_ms=25
+        )
+        pool.refresh()
+        self.assertEqual([e.username for e in pool.proxies], ["olduser"])
+        self.assertEqual(pool.current.username, "olduser")
+        self.assertEqual(pool.proxies[0].latency_ms, 25)
+
+    def test_refresh_accepts_new_credential_only_when_old_is_dead(self):
+        """旧凭证实测失效时，才接纳同节点的新凭证。"""
+        old = make_entry("1.1.1.1", 1080, username="olduser")
+        new = make_entry("1.1.1.1", 1080, username="newuser")
+        pool = self.build(entries=[old])
+        pool.refresh()
+
+        self.client.entries = [new]
+        pool._probe = lambda entry, url, timeout: ProbeResult(
+            ok=entry.username == "newuser", latency_ms=30
+        )
+        pool.refresh()
+        self.assertEqual([e.username for e in pool.proxies], ["newuser"])
+
+    def test_refresh_drops_node_when_both_credentials_dead(self):
+        """旧凭证和新凭证都不可用 -> 节点被舍弃。"""
+        old = make_entry("1.1.1.1", 1080, username="olduser")
+        new = make_entry("1.1.1.1", 1080, username="newuser")
+        pool = self.build(entries=[old])
+        pool.refresh()
+
+        self.client.entries = [new]
+        pool._probe = lambda entry, url, timeout: ProbeResult(ok=False)
+        self.assertEqual(pool.refresh(), [])
+        self.assertEqual(pool.proxies, [])
+
+    def test_refresh_keeps_delisted_node_with_working_old_credential(self):
+        """接口已下线该节点，但旧凭证仍可用 -> 继续保留，不因列表变化被清掉。"""
+        old = make_entry("1.1.1.1", 1080, username="olduser")
+        pool = self.build(entries=[old])
+        pool.refresh()
+
+        self.client.entries = [make_entry("2.2.2.2", 1080, username="fresh")]
+        pool._probe = lambda entry, url, timeout: ProbeResult(ok=True, latency_ms=20)
+        pool.refresh()
+        keys = {e.key for e in pool.proxies}
+        self.assertIn("1.1.1.1:1080", keys)
+        self.assertEqual(
+            next(e.username for e in pool.proxies if e.ip == "1.1.1.1"), "olduser"
+        )
+
+    def test_refresh_adds_new_nodes_alongside_sticky_ones(self):
+        """保留旧凭证的同时，接口里的全新节点也要能加进来。"""
+        self.settings = replace(self.settings, max_pick=3)
+        old = make_entry("1.1.1.1", 1080, username="olduser")
+        pool = self.build(entries=[old])
+        pool.refresh()
+
+        self.client.entries = [
+            make_entry("1.1.1.1", 1080, username="newuser"),
+            make_entry("2.2.2.2", 1080, username="fresh"),
+        ]
+        pool._probe = lambda entry, url, timeout: ProbeResult(ok=True, latency_ms=15)
+        pool.refresh()
+        by_ip = {e.ip: e.username for e in pool.proxies}
+        self.assertEqual(by_ip.get("1.1.1.1"), "olduser")
+        self.assertEqual(by_ip.get("2.2.2.2"), "fresh")
+
+    def test_sticky_credentials_survive_restart(self):
+        """可用旧凭证写进缓存，重启后仍用它，且不被接口新凭证覆盖。"""
+        old = make_entry("1.1.1.1", 1080, username="olduser", password="pw")
+        pool = self.build(entries=[old])
+        pool.refresh()
+        pool._probe = lambda entry, url, timeout: ProbeResult(
+            ok=entry.username == "olduser", latency_ms=12
+        )
+        pool.recheck()  # 触发落盘
+        pool.wait_idle(timeout=5)
+
+        new_client = FakeClient([make_entry("1.1.1.1", 1080, username="newuser")])
+        pool2 = Ip2FreeProxyPool(
+            self.settings,
+            state_dir=self.tmp.name,
+            client_factory=lambda **kwargs: new_client,
+            probe=lambda entry, url, timeout: ProbeResult(
+                ok=entry.username == "olduser", latency_ms=12
+            ),
+            clock=lambda: self.now[0],
+        )
+        self.pools.append(pool2)
+        current = pool2.bootstrap()
+        self.assertEqual(current.username, "olduser")
+        pool2.refresh()
+        self.assertEqual([e.username for e in pool2.proxies], ["olduser"])
+
+    def test_mark_failed_with_full_url_discards_credential(self):
+        """main.py 传的是完整 socks5h 连接串，必须能正确归一并舍弃。"""
+        entry = make_entry("1.1.1.1", 1080, username="olduser", password="pw")
+        pool = self.build(entries=[entry])
+        pool.refresh()
+        pool.mark_failed(entry.url)
+        self.assertEqual(pool.proxies, [])
+        # 落盘后重启也不会把已舍弃的凭证读回来
+        pool3 = Ip2FreeProxyPool(
+            self.settings, state_dir=self.tmp.name,
+            client_factory=lambda **kwargs: FakeClient([]),
+            probe=lambda e, u, t: ProbeResult(ok=True), clock=lambda: self.now[0],
+        )
+        self.pools.append(pool3)
+        pool3._load_cache()
+        self.assertEqual(pool3.proxies, [])
+
+    def test_pick_exclude_accepts_full_url(self):
+        pool = self.build(entries=[make_entry("1.1.1.1"), make_entry("2.2.2.2")])
+        pool.refresh()
+        excluded = make_entry("1.1.1.1").url
+        for _ in range(20):
+            self.assertEqual(pool.pick(exclude=[excluded]).ip, "2.2.2.2")
 
     def test_ensure_fresh_background_is_non_blocking(self):
         pool = self.build(entries=[make_entry("1.1.1.1")])

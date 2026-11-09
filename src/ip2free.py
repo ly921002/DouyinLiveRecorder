@@ -336,6 +336,39 @@ def normalize_proxies(
     return entries
 
 
+def _normalize_proxy_key(proxy: "ProxyEntry | str") -> str:
+    """把代理标识统一归一成 ``ip:port``。
+
+    程序里同时存在三种写法：``ProxyEntry``、``ip:port``、以及
+    ``socks5h://user:pass@ip:port``（main.py 传给 mark_failed / exclude 的就是连接串）。
+    不归一化的话失效代理永远匹配不上、也就永远不会被舍弃。
+    """
+    if isinstance(proxy, ProxyEntry):
+        return proxy.key
+    text = str(proxy or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        try:
+            parts = urlsplit(text)
+            hostname = parts.hostname or ""
+            port = parts.port
+            if hostname and port:
+                return "{0}:{1}".format(hostname, port)
+        except ValueError:
+            pass
+        return text
+    # 裸的 user:pass@ip:port
+    if "@" in text:
+        text = text.rsplit("@", 1)[-1]
+    return text
+
+
+def _credentials_changed(old: ProxyEntry, new: ProxyEntry) -> bool:
+    """同一 ip:port 上，接口返回的账号密码是否与当前生效的凭证不同。"""
+    return (old.username, old.password) != (new.username, new.password)
+
+
 def _is_ip(text: str) -> bool:
     try:
         ipaddress.ip_address(text)
@@ -835,47 +868,19 @@ class Ip2FreeProxyPool:
 
     # ---------------- 刷新
 
-    def refresh(self) -> list[ProxyEntry]:
-        """抓取 + 测速 + 落盘，返回本轮测出的可用代理（空表示失败，旧池保留）。
-
-        这里只负责「更新可用代理集合」，不改变本次使用的代理。
-        """
-        if not self._refresh_lock.acquire(blocking=False):
-            return self.proxies
-        try:
-            working, source = self._refresh_once()
-            if working:
-                now = self._clock()
-                self._commit(working, now)
-                with self._lock:
-                    self._updated_at = now
-                self._save_cache()
-                self._write_proxychains()
-                logger.info(
-                    "ip2free 测速完成：{0} 条可用 socks5 代理（来源：{1}，最快 {2}ms，"
-                    "选择方式：{3}）".format(len(working), source, working[0].latency_ms, self.settings.pick_mode)
-                )
-            else:
-                suffix = "：" + self.last_error if self.last_error else ""
-                logger.warning("ip2free 本轮未测出可用 socks5 代理{0}".format(suffix))
-            return working
-        finally:
-            self._refresh_lock.release()
-
-    def recheck(self) -> list[ProxyEntry]:
-        """复检当前代理池：剔除已失效的代理，并保留仍然可用的。"""
-        snapshot = self.proxies
-        if not snapshot:
+    def _probe_many(self, entries: Sequence[ProxyEntry], label: str) -> list[ProxyEntry]:
+        """并发实测一组代理，返回仍可用（带实测延迟）的条目。"""
+        if not entries:
             return []
         probe_func = self._probe or probe_proxy
-        workers = max(1, min(self.settings.max_workers, len(snapshot)))
+        workers = max(1, min(self.settings.max_workers, len(entries)))
         alive: list[ProxyEntry] = []
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ip2free-recheck") as executor:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=label) as executor:
             futures = {
                 executor.submit(
                     probe_func, entry, self.settings.test_url, self.settings.probe_timeout
                 ): entry
-                for entry in snapshot
+                for entry in entries
             }
             for future in as_completed(futures):
                 entry = futures[future]
@@ -885,7 +890,121 @@ class Ip2FreeProxyPool:
                     continue
                 if result.ok:
                     alive.append(replace(entry, latency_ms=result.latency_ms))
-        alive.sort(key=lambda item: (item.latency_ms, item.ip))
+        return alive
+
+    def _merge_with_sticky_credentials(
+        self, fetched: list[ProxyEntry]
+    ) -> tuple[list[ProxyEntry], int, int]:
+        """刷新时保留「实测仍可用」的旧凭证，只在必要时接纳接口的新凭证。
+
+        ip2free 会轮换同一 ``ip:port`` 上的账号密码，而新凭证常常还没生效、
+        旧凭证却仍然可用。直接拿接口列表覆盖会把能用的旧凭证丢掉。策略：
+
+        1. 对每个已缓存节点，用**它当前那套凭证**实测；仍可用则原样保留（不采纳新凭证）；
+        2. 缓存节点实测失败的，才拿接口里同节点的新凭证再测一次，能通才替换；
+        3. 接口里全新、缓存里没有的节点，按正常流程测速后加入；
+        4. 接口已下线的旧节点，只要复检仍可用就继续保留。
+
+        Returns:
+            (合并后的可用代理列表, 保留旧凭证条数, 采纳新凭证条数)
+        """
+        with self._lock:
+            cached = list(self._proxies)
+        fetched_by_key: dict[str, ProxyEntry] = {}
+        for entry in fetched:
+            # 接口同一节点若返回多条，保留 last_checked_at 最新的那条
+            existing = fetched_by_key.get(entry.key)
+            if existing is None or entry.last_checked_at > existing.last_checked_at:
+                fetched_by_key[entry.key] = entry
+
+        # 1) 缓存里的旧凭证全部实测一遍（含接口已下线的节点，给它们继续存活的机会）
+        still_alive = self._probe_many(cached, "ip2free-oldcred")
+        alive_by_key = {entry.key: entry for entry in still_alive}
+
+        kept = 0
+        accepted_new = 0
+        merged: dict[str, ProxyEntry] = dict(alive_by_key)
+
+        # 2) 旧凭证失效的同名节点 + 3) 接口里的全新节点，才测试新凭证
+        fresh_to_probe: list[ProxyEntry] = []
+        for key, new_entry in fetched_by_key.items():
+            if key in merged:
+                # 节点已有可用的旧凭证 -> 不采纳新凭证
+                if _credentials_changed(merged[key], new_entry):
+                    kept += 1
+                continue
+            fresh_to_probe.append(new_entry)
+
+        # 新节点按「最近校验过」优先，避免把测速次数浪费在陈旧的条目上
+        fresh_to_probe.sort(key=lambda item: item.last_checked_at, reverse=True)
+        fresh_to_probe = fresh_to_probe[: max(0, self.settings.max_candidates)]
+        for entry in self._probe_many(fresh_to_probe, "ip2free-newcred"):
+            merged[entry.key] = entry
+            accepted_new += 1
+
+        # 按延迟升序，并限制池子规模；保留下来的旧凭证同样参与后续随机/最快挑选
+        result = sorted(merged.values(), key=lambda item: (item.latency_ms, item.ip))
+        return result[: max(1, self.settings.max_pick)], kept, accepted_new
+
+    def refresh(self) -> list[ProxyEntry]:
+        """抓取 + 测速 + 落盘，返回本轮测出的可用代理（空表示失败，旧池保留）。
+
+        凭证粘性：已缓存且实测仍可用的旧凭证会继续生效，不会被接口返回的新凭证覆盖；
+        只有旧凭证实测失效、或接口出现全新节点时，才会实测并接纳新凭证。
+        """
+        if not self._refresh_lock.acquire(blocking=False):
+            return self.proxies
+        self.last_error = ""
+        cached_count = 0
+        merged: list[ProxyEntry] = []
+        source = "ip2free"
+        kept = accepted_new = 0
+        try:
+            try:
+                fetched, source = self._refresh_once()
+                # 即使接口没抓到任何东西（挂了 / 列表为空），也走同一套合并逻辑：
+                # 它会实测缓存里的旧凭证，仍可用的继续保留，不可用的才舍弃。
+                merged, kept, accepted_new = self._merge_with_sticky_credentials(fetched)
+                with self._lock:
+                    cached_count = len(self._proxies)
+            except Exception as exc:
+                self.last_error = "{0}: {1}".format(type(exc).__name__, exc)
+                logger.warning("ip2free 刷新异常：{0}".format(self.last_error))
+                return self.proxies
+
+            if merged:
+                now = self._clock()
+                self._commit(merged, now)
+                with self._lock:
+                    self._updated_at = now
+                self._save_cache()
+                self._write_proxychains()
+                logger.info(
+                    "ip2free 测速完成：{0} 条可用（来源：{1}，保留旧凭证 {2} 条，"
+                    "采纳新凭证 {3} 条，最快 {4}ms）".format(
+                        len(merged), source, kept, accepted_new, merged[0].latency_ms
+                    )
+                )
+            elif cached_count:
+                # 旧凭证也全部实测失效 -> 明确舍弃，避免死凭证残留在池里被 pick 选中
+                logger.warning("ip2free 缓存里的旧凭证已全部失效，清空代理池等待下次重新抓取")
+                now = self._clock()
+                self._commit([], now)
+                self._save_cache()
+                self._write_proxychains()
+            else:
+                suffix = "：" + self.last_error if self.last_error else ""
+                logger.warning("ip2free 本轮未测出可用 socks5 代理{0}".format(suffix))
+            return merged
+        finally:
+            self._refresh_lock.release()
+
+    def recheck(self) -> list[ProxyEntry]:
+        """复检当前代理池：每条都带「它自己那套凭证」实测，剔除失效的，保留仍可用的。"""
+        snapshot = self.proxies
+        if not snapshot:
+            return []
+        alive = self._probe_many(snapshot, "ip2free-recheck")
         if alive:
             now = self._clock()
             self._commit(alive, now)
@@ -904,6 +1023,7 @@ class Ip2FreeProxyPool:
         return alive
 
     def _refresh_once(self) -> tuple[list[ProxyEntry], str]:
+        """抓取接口候选列表（不做测速/截断），交给 refresh 做凭证粘性合并。"""
         raw: list[ProxyEntry] = []
         source = "ip2free"
         self.last_error = ""
@@ -926,20 +1046,11 @@ class Ip2FreeProxyPool:
         if not raw:
             return [], source
 
-        # 最近被 ip2free 校验过的优先测速，避免浪费探测次数
+        # 最近被 ip2free 校验过的优先测速，避免浪费探测次数。
+        # 这里不做 select_working：新凭证往往不可用，若先按新凭证筛一遍，
+        # 那些「旧凭证仍可用」的节点可能被提前淘汰，凭证粘性就无从谈起。
         raw.sort(key=lambda item: item.last_checked_at, reverse=True)
-        # 先测速筛掉不可用代理，保留最多 max_pick 条作为可用池，每次连接再从池里挑
-        working = select_working(
-            raw,
-            max_pick=self.settings.max_pick,
-            max_workers=self.settings.max_workers,
-            timeout=self.settings.probe_timeout,
-            test_url=self.settings.test_url,
-            max_candidates=self.settings.max_candidates,
-            probe=self._probe,
-            pick_mode=PICK_MODE_FASTEST,
-        )
-        return working, source
+        return raw, source
 
     def pick(self, exclude: Optional[Iterable[str]] = None) -> Optional[ProxyEntry]:
         """从「实测可用」的代理里挑选一条用作本次连接。
@@ -951,7 +1062,8 @@ class Ip2FreeProxyPool:
         """
         self.ensure_fresh(background=True)
         self._maybe_recheck_async()
-        banned = set(exclude or ())
+        banned = {_normalize_proxy_key(item) for item in (exclude or ())}
+        banned.discard("")
         entry = self._choose(banned)
         if entry is None:
             # 池子空（首次启动或代理全部失效）：同步抓一次，别让录制线程拿不到代理
@@ -1004,7 +1116,9 @@ class Ip2FreeProxyPool:
 
     def pick_fast(self, exclude: Optional[Iterable[str]] = None) -> Optional[ProxyEntry]:
         """只从「当前已验证可用」的池子里挑一条，不做复检/刷新（供本地桥接每连接调用）。"""
-        return self._choose(set(exclude or ())) or self._last_pick
+        banned = {_normalize_proxy_key(item) for item in (exclude or ())}
+        banned.discard("")
+        return self._choose(banned) or self._last_pick
 
     def bootstrap(self) -> Optional[ProxyEntry]:
         """启动时调用：优先用未过期缓存，否则（或缓存为空时）刷新一次，然后随机挑一条。"""
@@ -1067,8 +1181,14 @@ class Ip2FreeProxyPool:
         return picked if picked is not None else current
 
     def mark_failed(self, proxy: ProxyEntry | str) -> None:
-        """标记某条代理失败：从可用集合中移除，下次 pick 不会再选中它。"""
-        key = proxy.key if isinstance(proxy, ProxyEntry) else str(proxy)
+        """标记某条代理失效：从可用集合中移除，下次 pick 不会再选中它。
+
+        只有实测确认不可用才调用本方法；保留下来的旧凭证会一直用到这里为止。
+        参数可以是 ProxyEntry、``ip:port`` 或完整的 socks5h 连接串。
+        """
+        key = _normalize_proxy_key(proxy)
+        if not key:
+            return
         with self._lock:
             remaining = [entry for entry in self._proxies if entry.key != key]
             self._proxies = remaining
@@ -1076,6 +1196,8 @@ class Ip2FreeProxyPool:
             if self._last_pick is not None and self._last_pick.key == key:
                 self._last_pick = None
             self._index = 0
+            # 同步刷新缓存文件，避免重启后又把已失效的凭证读回来
+            self._save_cache()
             self._write_proxychains()
 
     def close(self) -> None:
