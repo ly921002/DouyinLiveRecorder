@@ -1787,15 +1787,32 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                 count_time = time.time()
 
                 except utils.PlatformBlockedError as e:
-                    # 平台按出口 IP 封禁：舍弃这条代理并立刻换一条，而不是干等下一轮
+                    # 平台按出口 IP 封禁 / 代理侧握手失败：舍弃这条代理并立刻换一条，而不是干等下一轮
                     blocked_proxy = proxy_address
                     logger.warning(
-                        f"{record_url} 代理出口被 {e.platform} 封禁（{e.detail or 'block'}）"
-                        f"，已舍弃该代理并切换重试"
+                        f"{record_url} 代理不可用 —— {e.platform} 封禁或代理连接失败"
+                        f"（{e.detail or 'block'}），已舍弃该代理并切换重试"
                     )
                     if ip2free_pool is not None and blocked_proxy:
                         ip2free_pool.mark_failed(blocked_proxy)
                         retry_proxy = ip2free_acquire_proxy(exclude=blocked_proxy)
+                        if retry_proxy:
+                            proxy_address = retry_proxy
+                            _thread_local.proxy_ok = False
+                            _thread_local.proxy_checked_at = 0
+                            logger.info(f"{record_url} 已切换代理 {retry_proxy} 重试")
+                            continue
+                    with max_request_lock:
+                        error_count += 1
+                        error_window.append(1)
+
+                except ConnectionError as e:
+                    # 走了代理但拿不到响应：大概率是这条代理不行，换一条再试
+                    logger.warning(f"{record_url} 请求失败: {e}")
+                    failed_proxy = proxy_address
+                    if ip2free_pool is not None and failed_proxy:
+                        ip2free_pool.mark_failed(failed_proxy)
+                        retry_proxy = ip2free_acquire_proxy(exclude=failed_proxy)
                         if retry_proxy:
                             proxy_address = retry_proxy
                             _thread_local.proxy_ok = False

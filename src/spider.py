@@ -47,6 +47,70 @@ def get_params(url: str, params: str) -> OptionalStr:
         return query_params[params][0]
 
 
+#: async_req 在请求异常时会把异常文本当响应体返回，这些前缀说明"根本没拿到响应"
+TRANSPORT_ERROR_MARKERS = (
+    "ProxyError",
+    "ConnectError",
+    "ConnectTimeout",
+    "ReadTimeout",
+    "ReadError",
+    "RemoteProtocolError",
+    "WriteError",
+    "PoolTimeout",
+    "All connection attempts failed",
+    "EOF occurred",
+    "Invalid username/password",
+)
+
+
+def parse_json_response(raw_str: str, *, proxy_addr: OptionalStr = None, url: str = "",
+                        platform: str = "") -> dict:
+    """把 async_req 的返回解析成 JSON，并对"非 JSON 响应"给出可行动的报错。
+
+    ``async_req`` 出错时不会抛异常，而是把 ``str(e)`` 当响应体返回，直接 ``json.loads``
+    只会得到 ``Expecting value: line 1 column 1 (char 0)``，看不出真实原因。
+    这里区分三类情况：
+    * 空响应           -> 平台返回空体，按网络异常处理；
+    * 传输层错误文本   -> 代理连不通/凭证失效，抛 ``PlatformBlockedError`` 触发换代理；
+    * 其它非 JSON 文本 -> 多半是被风控/返回了 HTML，带上正文片段方便定位。
+    """
+    text = "" if raw_str is None else str(raw_str)
+    stripped = text.strip()
+
+    if not stripped:
+        raise ConnectionError(
+            f"{platform or '平台'} 返回空响应"
+            + (f"（代理 {proxy_addr}）" if proxy_addr else "")
+            + (f" 直播间: {url}" if url else "")
+        )
+
+    for marker in TRANSPORT_ERROR_MARKERS:
+        if marker.lower() in stripped[:300].lower():
+            # 代理侧问题（连不上/认证失败）：换一条代理通常就能好，交给上层切换
+            raise utils.PlatformBlockedError(
+                platform or "平台",
+                detail=stripped[:160].replace("\n", " "),
+                url=url,
+                reason="proxy_error",
+            )
+
+    try:
+        data = json.loads(stripped)
+    except (ValueError, TypeError):
+        snippet = stripped[:160].replace("\n", " ")
+        raise ConnectionError(
+            f"{platform or '平台'} 返回的不是 JSON（{snippet}）"
+            + (f"，代理 {proxy_addr}" if proxy_addr else "")
+            + (f"，直播间: {url}" if url else "")
+        )
+    if not isinstance(data, dict):
+        raise ConnectionError(
+            f"{platform or '平台'} 返回的 JSON 结构异常（{type(data).__name__}）"
+            + (f" 直播间: {url}" if url else "")
+        )
+    return data
+
+
 async def get_play_url_list(m3u8: str, proxy: OptionalStr = None, header: OptionalDict = None,
                             abroad: bool = False) -> List[str]:
     resp = await async_req(url=m3u8, proxy_addr=proxy, headers=header, abroad=abroad)
@@ -1276,7 +1340,7 @@ async def get_pandatv_stream_data(url: str, proxy_addr: OptionalStr = None, cook
     result = {"anchor_name": "", "is_live": False}
     json_str = await async_req('https://api.pandalive.co.kr/v1/member/bj',
                        proxy_addr=proxy_addr, headers=headers, data=data, abroad=True)
-    json_data = json.loads(json_str)
+    json_data = parse_json_response(json_str, proxy_addr=proxy_addr, url=url, platform='PandaTV')
     if "bjInfo" not in json_data:
         message = str(json_data.get("message", "Unknown error"))
         # 封禁时 member/bj 也可能直接返回 errorData.code = block
@@ -1292,7 +1356,7 @@ async def get_pandatv_stream_data(url: str, proxy_addr: OptionalStr = None, cook
 
     if live_status:
         json_str = await async_req(url2, proxy_addr=proxy_addr, headers=headers, data=data2, abroad=True)
-        json_data = json.loads(json_str)
+        json_data = parse_json_response(json_str, proxy_addr=proxy_addr, url=url, platform='PandaTV')
         if 'errorData' in json_data:
             error_code = str(json_data['errorData'].get('code', ''))
             if error_code == 'block':
@@ -1307,7 +1371,14 @@ async def get_pandatv_stream_data(url: str, proxy_addr: OptionalStr = None, cook
                                    f"correctly fill in the login cookie in the configuration file.")
             else:
                 raise RuntimeError(json_data['errorData']['code'], json_data['message'])
-        play_url = json_data['PlayList']['hls'][0]['url']
+        try:
+            play_url = json_data['PlayList']['hls'][0]['url']
+        except (KeyError, IndexError, TypeError) as e:
+            # 结构不符时给出可定位的信息，而不是裸的 KeyError
+            raise ConnectionError(
+                f"PandaTV 播放列表解析失败（{type(e).__name__}: {e}），"
+                f"响应字段: {list(json_data.keys())}，直播间: {url}"
+            ) from e
         play_url_list = await get_play_url_list(m3u8=play_url, proxy=proxy_addr, header=headers, abroad=True)
         result |= {'is_live': True, 'm3u8_url': play_url, 'play_url_list': play_url_list}
     return result

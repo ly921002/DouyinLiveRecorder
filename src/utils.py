@@ -36,17 +36,24 @@ class Color:
 
 
 class PlatformBlockedError(ConnectionError):
-    """代理出口 IP 被目标平台封禁（平台按 IP 拒绝服务）。
+    """代理这条链路不可用，需要切换代理：平台按 IP 封禁，或代理本身握手/认证失败。
 
-    与"网络不通"区分开：代理本身是好的，只是这个平台不收这个出口 IP，
+    与"网络不通"区分开：换一条代理通常就能好，
     因此需要**切换代理**而不是直接放弃录制。
     """
 
-    def __init__(self, platform: str, detail: str = "", url: str = "") -> None:
+    def __init__(self, platform: str, detail: str = "", url: str = "",
+                 reason: str = "blocked") -> None:
         self.platform = platform
         self.detail = detail
         self.url = url
-        message = f"{platform} 已封禁该代理出口 IP"
+        self.reason = reason
+        if reason == "blocked":
+            message = f"{platform} 已封禁该代理出口 IP"
+        elif reason == "proxy_error":
+            message = f"{platform} 请求失败（代理不可用或凭证失效）"
+        else:
+            message = f"{platform} 请求失败"
         if detail:
             message += f"（{detail}）"
         if url:

@@ -272,6 +272,10 @@ ip2free测速地址 = https://www.gstatic.com/generate_204
   判定只认结构化字段 `errorData.code=block`（韩文/英文关键词兜底），
   **网络异常一律不判为封禁**，避免平台抖动误杀可用代理。可用 `ip2free平台封禁探测 = pandatv`
   控制（留空关闭）。
+- **代理侧失败也会换代理**：`async_req` 在请求异常时是把异常文本当响应体返回的，
+  直接 `json.loads` 只会报无意义的 `Expecting value: line 1 column 1 (char 0)`。
+  现在由 `spider.parse_json_response` 区分处理：凭证失效/连接失败 → 换代理重试；
+  空响应或返回 HTML → 报出明确原因与平台、代理、直播间，便于定位。
 - **ffmpeg 也走 socks5**：ffmpeg 的 `http` 协议只支持 HTTP 代理，程序会在 `127.0.0.1` 上起一个本地桥接，
   把 `-http_proxy` 的流量转给当前 socks5 代理，因此录像同样走代理出口。
 - **状态落盘**：工程目录 `.ip2free/` 下保存 `token.txt`（登录 token）、`proxy_cache.json`（可用代理与延迟）、
