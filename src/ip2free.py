@@ -93,7 +93,6 @@ CONFIG_KEYS: dict[str, str] = {
     "pick_mode": "ip2free代理选择方式",
     "recheck_minutes": "ip2free代理复检间隔(分钟)",
     "block_probes": "ip2free平台封禁探测",
-    "block_ttl_hours": "ip2free封禁记录有效期(小时)",
 }
 
 #: config.ini 缺失这些项时的默认值（会被 main.read_config_value 自动补写进配置文件）
@@ -111,7 +110,6 @@ CONFIG_DEFAULTS: dict[str, str] = {
     "pick_mode": PICK_MODE_RANDOM,
     "recheck_minutes": "5",
     "block_probes": DEFAULT_BLOCK_PROBES,
-    "block_ttl_hours": "6",
 }
 
 _TRUE_VALUES = {"是", "yes", "y", "true", "1", "on", "enable", "enabled"}
@@ -138,6 +136,10 @@ class ProxyEntry:
     city: str = ""
     latency_ms: int = 0
     last_checked_at: str = ""
+    #: 最近一次测速结果：True=能出网，False=测过但不通，None=还没测过（新加入的候选）
+    healthy: Optional[bool] = None
+    #: 最近一次测速时间（秒级时间戳），用于判断候选是否需要复测
+    probed_at: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.ip or not self.port:
@@ -156,6 +158,7 @@ class ProxyEntry:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProxyEntry":
+        healthy = data.get("healthy")
         return cls(
             ip=str(data.get("ip") or "").strip(),
             port=int(data.get("port") or 0),
@@ -166,6 +169,8 @@ class ProxyEntry:
             city=str(data.get("city") or ""),
             latency_ms=int(data.get("latency_ms") or 0),
             last_checked_at=str(data.get("last_checked_at") or ""),
+            healthy=None if healthy is None else bool(healthy),
+            probed_at=float(data.get("probed_at") or 0),
         )
 
     # ---------------- 展示 / 连接串
@@ -214,7 +219,6 @@ class Ip2FreeSettings:
     pick_mode: str = PICK_MODE_RANDOM
     recheck_minutes: int = 5
     block_probes: tuple[str, ...] = (DEFAULT_BLOCK_PROBES,)
-    block_ttl_hours: int = 6
 
     @property
     def has_credentials(self) -> bool:
@@ -233,7 +237,6 @@ class Ip2FreeSettings:
             self.test_url,
             self.pick_mode,
             self.block_probes,
-            self.block_ttl_hours,
         )
 
     @classmethod
@@ -287,7 +290,6 @@ class Ip2FreeSettings:
             pick_mode=pick_mode,
             recheck_minutes=_to_int(raw("recheck_minutes"), 5, 1, 720),
             block_probes=_parse_block_probes(raw("block_probes")),
-            block_ttl_hours=_to_int(raw("block_ttl_hours"), 6, 1, 720),
         )
 
 
@@ -856,6 +858,8 @@ class Ip2FreeProxyPool:
         self._refresh_lock = threading.Lock()
         self._refresh_thread: Optional[threading.Thread] = None
         self._proxies: list[ProxyEntry] = []
+        # 候选池：保存全部已知代理（含当前不通的），key -> ProxyEntry
+        self._candidates: dict[str, ProxyEntry] = {}
         self._index = 0
         self._updated_at = 0.0
         self.last_error = ""
@@ -865,8 +869,8 @@ class Ip2FreeProxyPool:
         self._checked_keys: set[str] = set()
         self._rechecking = False
         self._background_threads: list[threading.Thread] = []
-        # 平台封禁记录：ip:port -> {platform: 说明}，用于日志展示与避免重复探测
-        self._blocked: dict[str, dict[str, str]] = {}
+        # 已淘汰名单：ip:port -> 说明。命中即永久不再使用（平台封禁的 IP 不会自己恢复）
+        self._retired: dict[str, str] = {}
 
     # ---------------- 路径
 
@@ -908,24 +912,26 @@ class Ip2FreeProxyPool:
         return self._refresh_thread is not None and self._refresh_thread.is_alive()
 
     def is_stale(self) -> bool:
+        """是否该重新抓取候选列表（按刷新间隔）。"""
         with self._lock:
-            if not self._proxies:
+            if not self._candidates:
                 return True
             return (self._clock() - self._updated_at) >= self.settings.refresh_minutes * 60
 
     def needs_recheck(self) -> bool:
-        """代理池是否到了复检时间（ip2free 的免费代理随时可能失效）。"""
-        with self._lock:
-            if not self._proxies:
-                return False
-            return (self._clock() - self._checked_at) >= self.settings.recheck_minutes * 60
+        """是否有候选到了该复测的时间（按复检间隔）。"""
+        return bool(self._candidates_due())
 
     def status_line(self) -> str:
         entry = self.current
+        with self._lock:
+            total = len(self._candidates)
+            healthy = len(self._proxies)
+            retired = len(self._retired)
         if entry is None:
-            return "ip2free 代理池为空"
-        return "ip2free 可用代理 {0} 条，本次使用 {1}（{2}ms）".format(
-            len(self.proxies), entry.masked(), entry.latency_ms
+            return "ip2free 无可用代理（候选 {0} 条，已淘汰 {1} 条）".format(total, retired)
+        return "ip2free 可用 {0}/{1} 条（已淘汰 {2}），本次使用 {3}（{4}ms）".format(
+            healthy, total, retired, entry.masked(), entry.latency_ms
         )
 
     # ---------------- 客户端
@@ -962,12 +968,20 @@ class Ip2FreeProxyPool:
         updated_at = float(payload.get("updated_at") or 0)
         checked_at = float(payload.get("checked_at") or updated_at)
         with self._lock:
-            self._proxies = entries
+            # 候选池保存全部历史代理；可用集合只保留上次测得通的
+            self._candidates = {entry.key: entry for entry in entries}
+            healthy = [entry for entry in entries if entry.healthy]
+            healthy.sort(key=lambda item: (item.latency_ms, item.ip))
+            self._proxies = healthy
             self._updated_at = updated_at
             self._checked_at = checked_at
-            self._checked_keys = {entry.key for entry in entries}
+            self._checked_keys = {entry.key for entry in healthy}
             self._index = 0
-        logger.debug("ip2free 读取本地代理缓存 {0} 条：{1}".format(len(entries), path))
+        logger.debug(
+            "ip2free 读取本地缓存：候选 {0} 条，其中可用 {1} 条：{2}".format(
+                len(entries), len(healthy), path
+            )
+        )
 
     def _save_cache(self, last_pick: Optional[ProxyEntry] = None) -> None:
         with self._lock:
@@ -976,7 +990,8 @@ class Ip2FreeProxyPool:
                 "checked_at": self._checked_at,
                 "updated_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._updated_at or self._clock())),
                 "pick_mode": self.settings.pick_mode,
-                "proxies": [entry.to_dict() for entry in self._proxies],
+                # 落盘的是整个候选池（含当前不通的），这样重启后仍能继续复检
+                "proxies": [entry.to_dict() for entry in self._candidates.values()],
                 "last_pick": last_pick.to_dict() if last_pick is not None else None,
             }
         try:
@@ -1006,45 +1021,42 @@ class Ip2FreeProxyPool:
 
     # ---------------- 刷新
 
-    def _drop_known_blocked(self, entries: Sequence[ProxyEntry], label: str = "") -> list[ProxyEntry]:
-        """剔除仍在封禁有效期内的代理，一次探测都不做。"""
-        platforms = self.settings.block_probes
-        if not platforms:
-            return list(entries)
-        kept: list[ProxyEntry] = []
-        skipped: list[str] = []
+    def _drop_retired(self, entries: Sequence[ProxyEntry]) -> list[ProxyEntry]:
+        """剔除已淘汰（平台封禁）的代理，一次探测都不做。
+
+        平台封禁是按出口 IP 判定的，不会自己恢复，因此命中即**永久**不再使用，
+        既不测速也不重复探测，自然也不会重复刷同样的 WARNING。
+        """
         with self._lock:
-            for entry in entries:
-                record = self._blocked.get(entry.key) or {}
-                if record and self._block_record_valid(record, platforms):
-                    skipped.append(entry.key)
-                else:
-                    kept.append(entry)
+            retired = self._retired
+            if not retired:
+                return list(entries)
+            kept = [entry for entry in entries if entry.key not in retired]
+        skipped = len(entries) - len(kept)
         if skipped:
-            logger.debug(
-                "ip2free 跳过 {0} 条封禁记录仍在有效期的代理（{1}）：{2}".format(
-                    len(skipped), label or "probe", "、".join(skipped)
-                )
-            )
+            logger.debug("ip2free 跳过 {0} 条已淘汰代理（平台封禁），不再复用".format(skipped))
         return kept
 
+    def _retire(self, entry: ProxyEntry, reason: str) -> None:
+        """把代理加入淘汰名单（永久），并落盘。"""
+        with self._lock:
+            if entry.key in self._retired:
+                return
+            self._retired[entry.key] = reason
+        logger.warning(
+            "ip2free 代理 {0} 已淘汰（{1}），后续不再复用".format(entry.key, reason)
+        )
+
     def _filter_blocked(self, entries: Sequence[ProxyEntry]) -> list[ProxyEntry]:
-        """剔除被目标平台封禁的代理，并按需写日志。
+        """按平台探测结果淘汰被封禁的代理。
 
-        代理能出网不代表目标平台肯收（PandaTV 会按出口 IP 直接 403 block），
-        这类代理必须和"连不上"一样被舍弃，否则会一直占用池子、反复录制失败。
-
-        已知被封禁的代理会**直接跳过、不再重复探测**，也不再重复打 WARNING，
-        避免每小时刷新都把同样的几条代理重新测一遍、刷一堆重复日志。
+        代理能出网不代表目标平台肯收（PandaTV 会按出口 IP 直接 403 block）。
+        一旦确认封禁，就**永久淘汰**该代理：不再参与挑选、不再复测、不再重复告警。
         """
         platforms = self.settings.block_probes
-        if not platforms or not entries:
-            return list(entries)
-
-        # 命中已知封禁名单的直接丢弃，省掉一次平台请求（超过有效期则重新探测）
-        fresh = self._drop_known_blocked(entries, "block-probe")
-        if not fresh:
-            return []
+        fresh = self._drop_retired(entries)
+        if not platforms or not fresh:
+            return fresh
 
         probe_func = self._block_probe or probe_platform_blocks
         workers = max(1, min(self.settings.max_workers, len(fresh)))
@@ -1063,117 +1075,74 @@ class Ip2FreeProxyPool:
                 blocked_here = {p: r.detail for p, r in (results or {}).items() if r.blocked}
                 if not blocked_here:
                     kept.append(entry)
-                    if entry.key in self._blocked:
-                        self._blocked.pop(entry.key, None)
                     continue
-                with self._lock:
-                    self._blocked[entry.key] = {
-                        "platforms": blocked_here,
-                        "blocked_at": self._clock(),
-                    }
-                logger.warning(
-                    "ip2free 代理 {0} 被平台封禁（{1}），已舍弃并切换其他代理".format(
-                        entry.key,
-                        "、".join("{0}: {1}".format(p, d) for p, d in blocked_here.items()),
-                    )
+                self._retire(
+                    entry,
+                    "、".join("{0}: {1}".format(p, d) for p, d in blocked_here.items()),
                 )
-        self._save_blocked()
+        if kept != fresh:
+            self._save_retired()
 
-        # 保持入参顺序，便于调用方观察
         order = {entry.key: index for index, entry in enumerate(entries)}
         kept.sort(key=lambda item: order.get(item.key, 0))
         return kept
 
-    def blocked_info(self) -> dict[str, dict[str, str]]:
-        """当前被判定的平台封禁记录（ip:port -> {平台: 说明}），供日志/状态展示。"""
+    def retired_info(self) -> dict[str, str]:
+        """已淘汰代理（ip:port -> 原因），供状态展示。"""
         with self._lock:
-            return {
-                key: dict(record.get("platforms") or {})
-                for key, record in self._blocked.items()
-            }
-
-    def blocked_records(self) -> dict[str, dict[str, Any]]:
-        """完整的封禁记录（含 blocked_at 时间戳），供需要判定有效期的调用方使用。"""
-        with self._lock:
-            return {
-                key: {
-                    "platforms": dict(record.get("platforms") or {}),
-                    "blocked_at": float(record.get("blocked_at") or 0),
-                }
-                for key, record in self._blocked.items()
-            }
-
-    def _block_record_valid(self, record: dict, platforms: Sequence[str]) -> bool:
-        """封禁记录是否仍可复用：覆盖当前要探测的平台，且未超过有效期。"""
-        marked = record.get("platforms") or {}
-        if not any(platform in marked for platform in platforms):
-            return False
-        if self.settings.block_ttl_hours <= 0:
-            return True
-        blocked_at = float(record.get("blocked_at") or 0)
-        if blocked_at <= 0:
-            # 旧格式没有时间戳，按过期处理，让它重新验证一次
-            return False
-        return (self._clock() - blocked_at) < self.settings.block_ttl_hours * 3600
+            return dict(self._retired)
 
     @property
-    def blocked_path(self) -> Path:
-        return self.state_dir / "blocked.json"
+    def retired_path(self) -> Path:
+        return self.state_dir / "retired.json"
 
-    def _load_blocked(self) -> None:
-        """读取封禁名单：让重启后也不再复用已知被封禁的代理。"""
-        path = self.blocked_path
+    def _load_retired(self) -> None:
+        """读取淘汰名单：重启后同样不再复用被封禁的代理。"""
+        path = self.retired_path
         if not path.is_file():
             return
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
-        entries = payload.get("blocked") if isinstance(payload, dict) else None
-        if not isinstance(entries, dict):
+        raw = payload.get("retired") if isinstance(payload, dict) else None
+        if not isinstance(raw, dict):
             return
-        cleaned: dict[str, dict[str, Any]] = {}
-        for key, value in entries.items():
-            if not isinstance(value, dict) or not value:
-                continue
-            # 兼容旧结构（直接是 {平台: 说明}）
-            if "platforms" in value or "blocked_at" in value:
-                platforms = value.get("platforms") or {}
-                cleaned[str(key)] = {
-                    "platforms": {str(k): str(v) for k, v in platforms.items()} if isinstance(platforms, dict) else {},
-                    "blocked_at": float(value.get("blocked_at") or 0),
-                }
+        cleaned: dict[str, str] = {}
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                # 兼容旧的 blocked.json 结构
+                detail = value.get("platforms") or {}
+                text = "、".join("{0}: {1}".format(k, v) for k, v in detail.items()) or "platform block"
             else:
-                cleaned[str(key)] = {
-                    "platforms": {str(k): str(v) for k, v in value.items()},
-                    "blocked_at": 0.0,
-                }
+                text = str(value or "platform block")
+            cleaned[str(key)] = text
         with self._lock:
-            self._blocked = cleaned
+            self._retired.update(cleaned)
         if cleaned:
-            logger.debug("ip2free 载入封禁名单 {0} 条：{1}".format(len(cleaned), path))
+            logger.debug("ip2free 载入淘汰名单 {0} 条：{1}".format(len(cleaned), path))
 
-    def _save_blocked(self) -> None:
+    def _save_retired(self) -> None:
         with self._lock:
             payload = {
                 "updated_at": self._clock(),
                 "updated_text": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "blocked": {key: dict(value) for key, value in self._blocked.items()},
+                "retired": dict(self._retired),
             }
         try:
-            self.blocked_path.parent.mkdir(parents=True, exist_ok=True)
-            self.blocked_path.write_text(
+            self.retired_path.parent.mkdir(parents=True, exist_ok=True)
+            self.retired_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except OSError as exc:
-            logger.debug("写入封禁名单失败：{0}".format(exc))
+            logger.debug("写入淘汰名单失败：{0}".format(exc))
 
     def _probe_many(self, entries: Sequence[ProxyEntry], label: str) -> list[ProxyEntry]:
         """并发实测一组代理，返回仍可用（带实测延迟）的条目。"""
         if not entries:
             return []
         # 已知被封禁的直接跳过，连测速都不做（避免每小时重复请求同几条死代理）
-        entries = self._drop_known_blocked(entries, label)
+        entries = self._drop_retired(entries)
         if not entries:
             return []
         probe_func = self._probe or probe_proxy
@@ -1197,135 +1166,148 @@ class Ip2FreeProxyPool:
         # 能出网但被目标平台封禁的，等同于不可用：一并舍弃并记日志
         return self._filter_blocked(alive)
 
-    def _merge_with_sticky_credentials(
-        self, fetched: list[ProxyEntry]
-    ) -> tuple[list[ProxyEntry], int, int]:
-        """刷新时保留「实测仍可用」的旧凭证，只在必要时接纳接口的新凭证。
+    def _merge_candidates(self, fetched: list[ProxyEntry]) -> tuple[int, int]:
+        """把接口返回的代理并入「候选池」，保持凭证粘性。
 
         ip2free 会轮换同一 ``ip:port`` 上的账号密码，而新凭证常常还没生效、
-        旧凭证却仍然可用。直接拿接口列表覆盖会把能用的旧凭证丢掉。策略：
-
-        1. 对每个已缓存节点，用**它当前那套凭证**实测；仍可用则原样保留（不采纳新凭证）；
-        2. 缓存节点实测失败的，才拿接口里同节点的新凭证再测一次，能通才替换；
-        3. 接口里全新、缓存里没有的节点，按正常流程测速后加入；
-        4. 接口已下线的旧节点，只要复检仍可用就继续保留。
+        旧凭证却仍然可用。因此：
+        * 候选池里已有该节点 -> 保留原有凭证，不采纳接口的新凭证；
+        * 新节点 -> 加入候选池，标记为「未测」，等本轮/下轮测速决定可用性；
+        * 接口已下线的旧节点同样留在候选池（它可能仍能出网，要不要用由测速决定）。
 
         Returns:
-            (合并后的可用代理列表, 保留旧凭证条数, 采纳新凭证条数)
+            (新增候选数, 因凭证不同而保持旧凭证的条数)
         """
+        added = 0
+        kept_old_cred = 0
         with self._lock:
-            cached = list(self._proxies)
-        fetched_by_key: dict[str, ProxyEntry] = {}
-        for entry in fetched:
-            # 接口同一节点若返回多条，保留 last_checked_at 最新的那条
-            existing = fetched_by_key.get(entry.key)
-            if existing is None or entry.last_checked_at > existing.last_checked_at:
-                fetched_by_key[entry.key] = entry
+            for entry in fetched:
+                existing = self._candidates.get(entry.key)
+                if existing is not None:
+                    if _credentials_changed(existing, entry):
+                        kept_old_cred += 1
+                    continue
+                self._candidates[entry.key] = replace(
+                    entry, healthy=None, probed_at=0.0, latency_ms=0
+                )
+                added += 1
+        return added, kept_old_cred
 
-        # 1) 缓存里的旧凭证全部实测一遍（含接口已下线的节点，给它们继续存活的机会）
-        still_alive = self._probe_many(cached, "ip2free-oldcred")
-        alive_by_key = {entry.key: entry for entry in still_alive}
-
-        kept = 0
-        accepted_new = 0
-        merged: dict[str, ProxyEntry] = dict(alive_by_key)
-
-        # 2) 旧凭证失效的同名节点 + 3) 接口里的全新节点，才测试新凭证
-        fresh_to_probe: list[ProxyEntry] = []
-        for key, new_entry in fetched_by_key.items():
-            if key in merged:
-                # 节点已有可用的旧凭证 -> 不采纳新凭证
-                if _credentials_changed(merged[key], new_entry):
-                    kept += 1
+    def _candidates_due(self, force: bool = False) -> list[ProxyEntry]:
+        """挑出需要测速的候选：未测过的、上次不通的、或已过复检间隔的。"""
+        now = self._clock()
+        interval = self.settings.recheck_minutes * 60
+        with self._lock:
+            pool = list(self._candidates.values())
+            retired = self._retired
+        due: list[ProxyEntry] = []
+        for entry in pool:
+            if entry.key in retired:
                 continue
-            fresh_to_probe.append(new_entry)
+            if force or entry.healthy is not True:
+                due.append(entry)
+            elif (now - entry.probed_at) >= interval:
+                due.append(entry)
+        return due
 
-        # 新节点按「最近校验过」优先，避免把测速次数浪费在陈旧的条目上
-        fresh_to_probe.sort(key=lambda item: item.last_checked_at, reverse=True)
-        fresh_to_probe = fresh_to_probe[: max(0, self.settings.max_candidates)]
-        for entry in self._probe_many(fresh_to_probe, "ip2free-newcred"):
-            merged[entry.key] = entry
-            accepted_new += 1
-
-        # 按延迟升序，并限制池子规模；保留下来的旧凭证同样参与后续随机/最快挑选
-        result = sorted(merged.values(), key=lambda item: (item.latency_ms, item.ip))
-        return result[: max(1, self.settings.max_pick)], kept, accepted_new
+    def _apply_probe_results(
+        self, probed: Sequence[ProxyEntry], living: Sequence[ProxyEntry]
+    ) -> None:
+        """把测速结果写回候选池，并重算「当前可用集合」。"""
+        now = self._clock()
+        alive_keys = {entry.key for entry in living}
+        alive_by_key = {entry.key: entry for entry in living}
+        with self._lock:
+            for entry in probed:
+                current = self._candidates.get(entry.key)
+                if current is None:
+                    continue
+                if entry.key in alive_keys:
+                    fresh = alive_by_key[entry.key]
+                    self._candidates[entry.key] = replace(
+                        current,
+                        healthy=True,
+                        latency_ms=fresh.latency_ms,
+                        probed_at=now,
+                    )
+                else:
+                    self._candidates[entry.key] = replace(
+                        current, healthy=False, latency_ms=0, probed_at=now
+                    )
+            healthy = [
+                entry for entry in self._candidates.values()
+                if entry.healthy and entry.key not in self._retired
+            ]
+            healthy.sort(key=lambda item: (item.latency_ms, item.ip))
+            self._proxies = healthy
+            self._checked_keys = {entry.key for entry in healthy}
+            self._checked_at = now
+            self._index = 0
 
     def refresh(self) -> list[ProxyEntry]:
-        """抓取 + 测速 + 落盘，返回本轮测出的可用代理（空表示失败，旧池保留）。
+        """抓取候选并入池，然后测速，返回当前可用代理列表。
 
-        凭证粘性：已缓存且实测仍可用的旧凭证会继续生效，不会被接口返回的新凭证覆盖；
-        只有旧凭证实测失效、或接口出现全新节点时，才会实测并接纳新凭证。
+        * 候选池保存**全部**已知代理（含当前不通的），每轮只测「到期该测」的那些；
+        * 被测出不通的代理留在候选池，等下一轮复检再试，不会一次性丢弃；
+        * 平台封禁的代理进入淘汰名单，永久不再测也不再用。
         """
         if not self._refresh_lock.acquire(blocking=False):
             return self.proxies
         self.last_error = ""
-        cached_count = 0
-        merged: list[ProxyEntry] = []
         source = "ip2free"
-        kept = accepted_new = 0
         try:
             try:
                 fetched, source = self._refresh_once()
-                # 即使接口没抓到任何东西（挂了 / 列表为空），也走同一套合并逻辑：
-                # 它会实测缓存里的旧凭证，仍可用的继续保留，不可用的才舍弃。
-                merged, kept, accepted_new = self._merge_with_sticky_credentials(fetched)
-                with self._lock:
-                    cached_count = len(self._proxies)
+                added, kept_old_cred = self._merge_candidates(fetched)
             except Exception as exc:
                 self.last_error = "{0}: {1}".format(type(exc).__name__, exc)
                 logger.warning("ip2free 刷新异常：{0}".format(self.last_error))
                 return self.proxies
 
-            if merged:
-                now = self._clock()
-                self._commit(merged, now)
+            due = self._candidates_due()
+            probed: list[ProxyEntry] = []
+            living: list[ProxyEntry] = []
+            if due:
+                due.sort(key=lambda item: (item.healthy is not None, item.probed_at))
+                due = due[: max(1, self.settings.max_candidates)]
+                probed = due
+                living = self._probe_many(due, "ip2free-refresh")
+                self._apply_probe_results(probed, living)
                 with self._lock:
-                    self._updated_at = now
+                    self._updated_at = self._clock()
                 self._save_cache()
                 self._write_proxychains()
-                logger.info(
-                    "ip2free 测速完成：{0} 条可用（来源：{1}，保留旧凭证 {2} 条，"
-                    "采纳新凭证 {3} 条，最快 {4}ms）".format(
-                        len(merged), source, kept, accepted_new, merged[0].latency_ms
-                    )
+
+            with self._lock:
+                total = len(self._candidates)
+            logger.info(
+                "ip2free 刷新完成：候选 {0} 条（新增 {1}，沿用旧凭证 {2}），"
+                "本轮测速 {3} 条，可用 {4} 条".format(
+                    total, added, kept_old_cred, len(probed), len(living)
                 )
-            elif cached_count:
-                # 旧凭证也全部实测失效 -> 明确舍弃，避免死凭证残留在池里被 pick 选中
-                logger.warning("ip2free 缓存里的旧凭证已全部失效，清空代理池等待下次重新抓取")
-                now = self._clock()
-                self._commit([], now)
-                self._save_cache()
-                self._write_proxychains()
-            else:
-                suffix = "：" + self.last_error if self.last_error else ""
-                logger.warning("ip2free 本轮未测出可用 socks5 代理{0}".format(suffix))
-            return merged
+            )
+            # 返回当前可用集（而不是仅本轮测通的），调用方拿到的是真实可用状态
+            return self.proxies
         finally:
             self._refresh_lock.release()
 
     def recheck(self) -> list[ProxyEntry]:
-        """复检当前代理池：每条都带「它自己那套凭证」实测，剔除失效的，保留仍可用的。"""
-        snapshot = self.proxies
-        if not snapshot:
-            return []
-        alive = self._probe_many(snapshot, "ip2free-recheck")
-        if alive:
-            now = self._clock()
-            self._commit(alive, now)
-            self._save_cache()
-            self._write_proxychains()
-            dropped = len(snapshot) - len(alive)
-            logger.info(
-                "ip2free 复检完成：{0} 条仍然可用{1}".format(
-                    len(alive), "，剔除 {0} 条失效代理".format(dropped) if dropped else ""
-                )
-            )
-        else:
-            logger.warning("ip2free 复检：代理池内所有代理均已失效，稍后重新抓取")
-            now = self._clock()
-            self._commit([], now)
-        return alive
+        """复检：把到期该测的候选全部测一遍，更新可用集合。"""
+        with self._lock:
+            if not self._candidates:
+                return []
+        due = self._candidates_due()
+        if not due:
+            return self.proxies
+        due = due[: max(1, self.settings.max_candidates)]
+        living = self._probe_many(due, "ip2free-recheck")
+        self._apply_probe_results(due, living)
+        self._save_cache()
+        self._write_proxychains()
+        logger.info(
+            "ip2free 复检完成：测速 {0} 条，可用 {1} 条".format(len(due), len(living))
+        )
+        return living
 
     def _refresh_once(self) -> tuple[list[ProxyEntry], str]:
         """抓取接口候选列表（不做测速/截断），交给 refresh 做凭证粘性合并。"""
@@ -1426,14 +1408,11 @@ class Ip2FreeProxyPool:
         return self._choose(banned) or self._last_pick
 
     def bootstrap(self) -> Optional[ProxyEntry]:
-        """启动时调用：优先用未过期缓存，否则（或缓存为空时）刷新一次，然后随机挑一条。"""
+        """启动时调用：载入候选池与淘汰名单，按需刷新，然后挑一条可用代理。"""
         self._load_cache()
-        self._load_blocked()
-        if self.proxies and not self.is_stale():
-            logger.debug("ip2free 使用本地缓存代理池：{0} 条可用".format(len(self.proxies)))
-        else:
+        self._load_retired()
+        if not self.proxies or self.is_stale():
             self.refresh()
-        # 缓存可能过期很久，首次使用前再复检一次，避免直接拿失效代理开录
         return self.pick()
 
     def wait_idle(self, timeout: float = 10.0) -> bool:
@@ -1487,18 +1466,24 @@ class Ip2FreeProxyPool:
         return picked if picked is not None else current
 
     def mark_failed(self, proxy: ProxyEntry | str) -> None:
-        """标记某条代理失效：从可用集合中移除，下次 pick 不会再选中它。
+        """标记某条代理**本次**失败：从可用集合移除，但保留在候选池等下次复检。
 
-        只有实测确认不可用才调用本方法；保留下来的旧凭证会一直用到这里为止。
+        与平台封禁不同，这类失败（连不上、超时、凭证暂未生效）可能只是暂时的，
+        因此不淘汰，只标记为不健康，让下一轮复检重新验证。
         参数可以是 ProxyEntry、``ip:port`` 或完整的 socks5h 连接串。
         """
         key = _normalize_proxy_key(proxy)
         if not key:
             return
+        now = self._clock()
         with self._lock:
-            remaining = [entry for entry in self._proxies if entry.key != key]
-            self._proxies = remaining
+            self._proxies = [entry for entry in self._proxies if entry.key != key]
             self._checked_keys.discard(key)
+            current = self._candidates.get(key)
+            if current is not None:
+                self._candidates[key] = replace(
+                    current, healthy=False, latency_ms=0, probed_at=now
+                )
             if self._last_pick is not None and self._last_pick.key == key:
                 self._last_pick = None
             self._index = 0
@@ -1506,10 +1491,34 @@ class Ip2FreeProxyPool:
             self._save_cache()
             self._write_proxychains()
 
+    def retire(self, proxy: ProxyEntry | str, reason: str = "platform block") -> None:
+        """永久淘汰一条代理（平台按 IP 封禁，不会自行恢复）。"""
+        key = _normalize_proxy_key(proxy)
+        if not key:
+            return
+        entry = self._candidates.get(key)
+        with self._lock:
+            if entry is not None:
+                self._retire(entry, reason)
+            else:
+                if key in self._retired:
+                    return
+                self._retired[key] = reason
+                logger.warning("ip2free 代理 {0} 已淘汰（{1}），后续不再复用".format(key, reason))
+            self._proxies = [item for item in self._proxies if item.key != key]
+            self._checked_keys.discard(key)
+            if self._last_pick is not None and self._last_pick.key == key:
+                self._last_pick = None
+            self._index = 0
+        self._save_retired()
+        self._save_cache()
+        self._write_proxychains()
+
     def close(self) -> None:
         self.wait_idle(timeout=5.0)
         with self._lock:
             self._proxies = []
+            self._candidates = {}
             self._index = 0
             self._updated_at = 0.0
             self._checked_at = 0.0

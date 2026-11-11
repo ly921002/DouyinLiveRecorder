@@ -1787,15 +1787,24 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                 count_time = time.time()
 
                 except utils.PlatformBlockedError as e:
-                    # 平台按出口 IP 封禁 / 代理侧握手失败：舍弃这条代理并立刻换一条，而不是干等下一轮
-                    blocked_proxy = proxy_address
-                    logger.warning(
-                        f"{record_url} 代理不可用 —— {e.platform} 封禁或代理连接失败"
-                        f"（{e.detail or 'block'}），已舍弃该代理并切换重试"
-                    )
-                    if ip2free_pool is not None and blocked_proxy:
-                        ip2free_pool.mark_failed(blocked_proxy)
-                        retry_proxy = ip2free_acquire_proxy(exclude=blocked_proxy)
+                    # 平台按出口 IP 封禁 -> 永久淘汰；代理侧握手失败 -> 只标记本次失败
+                    dead_proxy = proxy_address
+                    if getattr(e, 'reason', 'blocked') == 'blocked':
+                        logger.warning(
+                            f"{record_url} 代理出口被 {e.platform} 封禁（{e.detail or 'block'}），"
+                            f"永久淘汰该代理并切换重试"
+                        )
+                    else:
+                        logger.warning(
+                            f"{record_url} 代理不可用（{e.platform}: {e.detail or 'proxy error'}），"
+                            f"暂时停用该代理并切换重试"
+                        )
+                    if ip2free_pool is not None and dead_proxy:
+                        if getattr(e, 'reason', 'blocked') == 'blocked':
+                            ip2free_pool.retire(dead_proxy, f"{e.platform}: {e.detail or 'block'}")
+                        else:
+                            ip2free_pool.mark_failed(dead_proxy)
+                        retry_proxy = ip2free_acquire_proxy(exclude=dead_proxy)
                         if retry_proxy:
                             proxy_address = retry_proxy
                             _thread_local.proxy_ok = False
@@ -2171,11 +2180,14 @@ def get_web_runtime_snapshot() -> dict[str, Any]:
 def ip2free_snapshot() -> dict[str, Any]:
     """ip2free 代理池的脱敏运行时快照。"""
     if ip2free_pool is None:
-        return {'enabled': False, 'proxy_count': 0, 'current': '', 'last_error': ''}
+        return {'enabled': False, 'proxy_count': 0, 'candidate_count': 0,
+                'retired_count': 0, 'current': '', 'last_error': ''}
     current = ip2free_pool.current
     return {
         'enabled': True,
         'proxy_count': len(ip2free_pool.proxies),
+        'candidate_count': len(ip2free_pool._candidates),
+        'retired_count': len(ip2free_pool.retired_info()),
         'current': current.masked() if current else '',
         'latency_ms': current.latency_ms if current else 0,
         'last_error': ip2free_pool.last_error,

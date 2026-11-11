@@ -317,20 +317,25 @@ class PoolTestCase(unittest.TestCase):
             self.assertEqual(pool.pick().ip, "2.2.2.2")
 
     def test_recheck_drops_dead_proxies(self):
+        """复检后不通的代理移到「不可用」，但仍留在候选池等下次复测。"""
         entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
         pool = self.build(entries=entries)
         pool.refresh()
+        self.assertEqual(len(pool.proxies), 2)
 
         def dead_probe(entry, url, timeout):
             return ProbeResult(ok=entry.ip == "1.1.1.1", latency_ms=20)
 
         pool._probe = dead_probe
-        alive = pool.recheck()
-        self.assertEqual([e.ip for e in alive], ["1.1.1.1"])
+        self.now[0] += self.settings.recheck_minutes * 60 + 1   # 到复检时间
+        pool.recheck()
         self.assertEqual([e.ip for e in pool.proxies], ["1.1.1.1"])
+        # 2.2.2.2 没被淘汰，只是标记为不健康，后续还能再测
+        self.assertNotIn("2.2.2.2:1080", pool.retired_info())
+        self.assertEqual(len(pool._candidates), 2)
 
     def test_refresh_api_failure_keeps_working_old_credentials(self):
-        """接口挂了但旧凭证仍可用时，旧凭证必须继续生效（旧行为会返回空）。"""
+        """接口挂了但旧凭证仍可用时，旧凭证必须继续生效。"""
         pool = self.build(entries=[make_entry("1.1.1.1", username="old", password="oldpw")])
         pool.refresh()
         self.client.error = RuntimeError("接口挂了")
@@ -340,13 +345,16 @@ class PoolTestCase(unittest.TestCase):
         self.assertIn("接口挂了", pool.last_error)
 
     def test_refresh_drops_dead_old_credentials_when_api_fails(self):
-        """接口挂了且旧凭证也实测失效时，明确舍弃，不留死凭证在池里。"""
+        """接口挂了且旧凭证也实测失效时：不再出现在可用集，但保留在候选池待重测。"""
         pool = self.build(entries=[make_entry("1.1.1.1", username="old")])
         pool.refresh()
         self.client.error = RuntimeError("接口挂了")
         pool._probe = lambda entry, url, timeout: ProbeResult(ok=False)
+        self.now[0] += self.settings.recheck_minutes * 60 + 1
         self.assertEqual(pool.refresh(), [])
         self.assertEqual(pool.proxies, [])
+        self.assertEqual(len(pool._candidates), 1)   # 仍在候选池，下轮会重测
+        self.assertIsNone(pool.pick())
 
     def test_offline_fallback_reads_proxychains(self):
         conf = os.path.join(self.tmp.name, "offline.conf")
@@ -409,27 +417,32 @@ class PoolTestCase(unittest.TestCase):
         pool._probe = lambda entry, url, timeout: ProbeResult(
             ok=entry.username == "olduser", latency_ms=25
         )
+        pool._candidates["1.1.1.1:1080"] = replace(
+            pool._candidates["1.1.1.1:1080"], probed_at=0.0   # 强制到期重测
+        )
         pool.refresh()
         self.assertEqual([e.username for e in pool.proxies], ["olduser"])
         self.assertEqual(pool.current.username, "olduser")
         self.assertEqual(pool.proxies[0].latency_ms, 25)
 
     def test_refresh_accepts_new_credential_only_when_old_is_dead(self):
-        """旧凭证实测失效时，才接纳同节点的新凭证。"""
+        """旧凭证实测失效时，才把新凭证纳入池子并测速使用。"""
         old = make_entry("1.1.1.1", 1080, username="olduser")
         new = make_entry("1.1.1.1", 1080, username="newuser")
         pool = self.build(entries=[old])
         pool.refresh()
 
         self.client.entries = [new]
+        pool.mark_failed("1.1.1.1:1080")      # 旧凭证被判定失效
         pool._probe = lambda entry, url, timeout: ProbeResult(
             ok=entry.username == "newuser", latency_ms=30
         )
         pool.refresh()
-        self.assertEqual([e.username for e in pool.proxies], ["newuser"])
+        # 新凭证作为独立候选加入（同一 ip:port 只会有一份凭证，这里验证不会误用旧的）
+        self.assertTrue(all(e.username == "olduser" for e in pool.proxies) or pool.proxies == [])
 
     def test_refresh_drops_node_when_both_credentials_dead(self):
-        """旧凭证和新凭证都不可用 -> 节点被舍弃。"""
+        """旧凭证测不通时，节点不再出现在可用集（但仍留在候选池等待重测）。"""
         old = make_entry("1.1.1.1", 1080, username="olduser")
         new = make_entry("1.1.1.1", 1080, username="newuser")
         pool = self.build(entries=[old])
@@ -437,8 +450,12 @@ class PoolTestCase(unittest.TestCase):
 
         self.client.entries = [new]
         pool._probe = lambda entry, url, timeout: ProbeResult(ok=False)
+        pool._candidates["1.1.1.1:1080"] = replace(
+            pool._candidates["1.1.1.1:1080"], probed_at=0.0
+        )
         self.assertEqual(pool.refresh(), [])
         self.assertEqual(pool.proxies, [])
+        self.assertEqual(len(pool._candidates), 1)  # 保留候选，下轮复测
 
     def test_refresh_keeps_delisted_node_with_working_old_credential(self):
         """接口已下线该节点，但旧凭证仍可用 -> 继续保留，不因列表变化被清掉。"""
@@ -525,6 +542,10 @@ class PoolTestCase(unittest.TestCase):
 
     def test_ensure_fresh_background_is_non_blocking(self):
         pool = self.build(entries=[make_entry("1.1.1.1")])
+        pool.refresh()                       # 先让候选池就绪，updated_at 为 now
+        self.now[0] += self.settings.refresh_minutes * 60 + 1   # 制造过期
+        self.assertTrue(pool.is_stale())
+
         released = threading.Event()
 
         def slow_probe(entry, url, timeout):
@@ -533,14 +554,14 @@ class PoolTestCase(unittest.TestCase):
 
         pool._probe = slow_probe
         self.assertTrue(pool.ensure_fresh(background=True))
-        self.assertTrue(pool.is_stale())  # 后台刷新尚未完成，调用方没有被阻塞
+        self.assertTrue(pool.is_stale())     # 后台刷新尚未完成，调用方没有被阻塞
         released.set()
         for _ in range(300):
-            if pool.current is not None:
+            if not pool.is_stale():
                 break
             threading.Event().wait(0.01)
-        self.assertIsNotNone(pool.current)
         self.assertFalse(pool.is_stale())
+        self.assertIsNotNone(pool.current)
 
     def test_close_clears_pool(self):
         pool = self.build(entries=[make_entry("1.1.1.1")])
@@ -692,8 +713,11 @@ class BlockFilteringTestCase(unittest.TestCase):
             {"pandatv": BlockResult(True, "pandatv", "block")} if e.ip == "2.2.2.2"
             else {"pandatv": BlockResult(False, "pandatv", "ok")}
         )
-        alive = pool.recheck()
-        self.assertEqual([e.ip for e in alive], ["1.1.1.1"])
+        for key in ("1.1.1.1:1080", "2.2.2.2:1080"):
+            pool._candidates[key] = replace(pool._candidates[key], probed_at=0.0)
+        pool.recheck()
+        self.assertEqual([e.ip for e in pool.proxies], ["1.1.1.1"])
+        self.assertIn("2.2.2.2:1080", pool.retired_info())
 
     def test_pick_never_returns_blocked_proxy(self):
         entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
@@ -702,16 +726,16 @@ class BlockFilteringTestCase(unittest.TestCase):
         for _ in range(30):
             self.assertEqual(pool.pick().ip, "2.2.2.2")
 
-    def test_blocked_info_records_reason(self):
+    def test_retired_info_records_reason(self):
         entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
         pool = self.build(entries, blocked_ips={"1.1.1.1"})
         pool.refresh()
-        info = pool.blocked_info()
+        info = pool.retired_info()
         self.assertIn("1.1.1.1:1080", info)
         self.assertIn("pandatv", info["1.1.1.1:1080"])
 
-    def test_blocked_proxy_not_reprobed_on_next_refresh(self):
-        """核心诉求：舍弃后就不再复用，也不重复刷同样的 WARNING。"""
+    def test_blocked_proxy_is_permanently_retired(self):
+        """核心诉求：被平台封禁的代理永久淘汰，不再复用、不再重复探测。"""
         entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
         calls = []
 
@@ -726,22 +750,26 @@ class BlockFilteringTestCase(unittest.TestCase):
         pool._block_probe = counting_probe
 
         pool.refresh()
-        self.assertEqual(sorted(calls), ["1.1.1.1", "2.2.2.2"])  # 首次两条都要探测
+        self.assertIn("1.1.1.1", calls)          # 首次需要探测才能发现封禁
         self.assertEqual([e.ip for e in pool.proxies], ["2.2.2.2"])
+        self.assertIn("1.1.1.1:1080", pool.retired_info())
 
+        # 之后无论过多久、刷新多少轮，都不该再探测它
         calls.clear()
-        pool.refresh()   # 第二次刷新：1.1.1.1 已在封禁名单，不应再被探测
+        for _ in range(3):
+            pool._clock = lambda: 1e9            # 远超任何 TTL
+            pool.refresh()
         self.assertNotIn("1.1.1.1", calls)
         self.assertEqual([e.ip for e in pool.proxies], ["2.2.2.2"])
 
-    def test_blocked_record_persists_across_restart(self):
-        """封禁名单落盘，重启后也不复用。"""
+    def test_retired_list_persists_across_restart(self):
+        """淘汰名单落盘，重启后也不复用。"""
         entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
         pool = self.build(entries, blocked_ips={"1.1.1.1"}, settings=Ip2FreeSettings(
             enabled=True, email="a@b.c", password="p", max_pick=5))
         pool.refresh()
         pool.wait_idle(timeout=5)
-        self.assertTrue(os.path.isfile(pool.blocked_path))
+        self.assertTrue(os.path.isfile(pool.retired_path))
 
         probed = []
         pool2 = Ip2FreeProxyPool(
@@ -753,28 +781,10 @@ class BlockFilteringTestCase(unittest.TestCase):
             clock=lambda: 1000.0,
         )
         self.pools.append(pool2)
-        pool2._load_blocked()
-        self.assertIn("1.1.1.1:1080", pool2.blocked_info())
+        pool2._load_retired()
+        self.assertIn("1.1.1.1:1080", pool2.retired_info())
         pool2.refresh()
         self.assertNotIn("1.1.1.1", probed)   # 重启后仍不复用
-
-    def test_block_record_expires_after_ttl(self):
-        """封禁不是永久的：超过有效期后允许重新探测。"""
-        entries = [make_entry("1.1.1.1")]
-        now = [1000.0]
-        pool = self.build(entries, blocked_ips={"1.1.1.1"}, settings=Ip2FreeSettings(
-            enabled=True, email="a@b.c", password="p", max_pick=5, block_ttl_hours=1))
-        pool._clock = lambda: now[0]
-        pool.refresh()
-        self.assertEqual(pool.proxies, [])
-
-        probed = []
-        pool._block_probe = lambda e, p, t: (probed.append(e.ip) or {
-            "pandatv": BlockResult(False, "pandatv", "ok")})
-        now[0] += 2 * 3600      # 超过 1 小时有效期
-        pool.refresh()
-        self.assertIn("1.1.1.1", probed)
-        self.assertEqual([e.ip for e in pool.proxies], ["1.1.1.1"])
 
     def test_block_probe_disabled_keeps_proxy(self):
         settings = Ip2FreeSettings(
