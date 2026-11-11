@@ -272,6 +272,10 @@ ip2free测速地址 = https://www.gstatic.com/generate_204
   判定只认结构化字段 `errorData.code=block`（韩文/英文关键词兜底），
   **网络异常一律不判为封禁**，避免平台抖动误杀可用代理。可用 `ip2free平台封禁探测 = pandatv`
   控制（留空关闭）。
+- **舍弃后不再复用**：被封禁的代理会写进 `.ip2free/blocked.json` 并在有效期内
+  （`ip2free封禁记录有效期(小时)`，默认 6 小时）**直接跳过，既不再测速也不再重复探测**，
+  因此每小时刷新不会把同样几条代理重新验一遍、刷一屏重复的 WARNING。
+  到期后自动重新验证，平台解封即可恢复使用。重启后名单依然生效。
 - **代理侧失败也会换代理**：`async_req` 在请求异常时是把异常文本当响应体返回的，
   直接 `json.loads` 只会报无意义的 `Expecting value: line 1 column 1 (char 0)`。
   现在由 `spider.parse_json_response` 区分处理：凭证失效/连接失败 → 换代理重试；

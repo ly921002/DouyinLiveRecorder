@@ -710,6 +710,72 @@ class BlockFilteringTestCase(unittest.TestCase):
         self.assertIn("1.1.1.1:1080", info)
         self.assertIn("pandatv", info["1.1.1.1:1080"])
 
+    def test_blocked_proxy_not_reprobed_on_next_refresh(self):
+        """核心诉求：舍弃后就不再复用，也不重复刷同样的 WARNING。"""
+        entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
+        calls = []
+
+        def counting_probe(entry, platforms, timeout):
+            calls.append(entry.ip)
+            if entry.ip == "1.1.1.1":
+                return {"pandatv": BlockResult(True, "pandatv", "HTTP 403 errorData.code=block")}
+            return {"pandatv": BlockResult(False, "pandatv", "HTTP 200")}
+
+        pool = self.build(entries, blocked_ips=set(), settings=Ip2FreeSettings(
+            enabled=True, email="a@b.c", password="p", max_pick=5))
+        pool._block_probe = counting_probe
+
+        pool.refresh()
+        self.assertEqual(sorted(calls), ["1.1.1.1", "2.2.2.2"])  # 首次两条都要探测
+        self.assertEqual([e.ip for e in pool.proxies], ["2.2.2.2"])
+
+        calls.clear()
+        pool.refresh()   # 第二次刷新：1.1.1.1 已在封禁名单，不应再被探测
+        self.assertNotIn("1.1.1.1", calls)
+        self.assertEqual([e.ip for e in pool.proxies], ["2.2.2.2"])
+
+    def test_blocked_record_persists_across_restart(self):
+        """封禁名单落盘，重启后也不复用。"""
+        entries = [make_entry("1.1.1.1"), make_entry("2.2.2.2")]
+        pool = self.build(entries, blocked_ips={"1.1.1.1"}, settings=Ip2FreeSettings(
+            enabled=True, email="a@b.c", password="p", max_pick=5))
+        pool.refresh()
+        pool.wait_idle(timeout=5)
+        self.assertTrue(os.path.isfile(pool.blocked_path))
+
+        probed = []
+        pool2 = Ip2FreeProxyPool(
+            pool.settings, state_dir=self.tmp.name,
+            client_factory=lambda **kwargs: FakeClient(entries),
+            probe=lambda e, u, t: ProbeResult(ok=True, latency_ms=10),
+            block_probe=lambda e, p, t: (probed.append(e.ip) or {
+                "pandatv": BlockResult(True, "pandatv", "block")}),
+            clock=lambda: 1000.0,
+        )
+        self.pools.append(pool2)
+        pool2._load_blocked()
+        self.assertIn("1.1.1.1:1080", pool2.blocked_info())
+        pool2.refresh()
+        self.assertNotIn("1.1.1.1", probed)   # 重启后仍不复用
+
+    def test_block_record_expires_after_ttl(self):
+        """封禁不是永久的：超过有效期后允许重新探测。"""
+        entries = [make_entry("1.1.1.1")]
+        now = [1000.0]
+        pool = self.build(entries, blocked_ips={"1.1.1.1"}, settings=Ip2FreeSettings(
+            enabled=True, email="a@b.c", password="p", max_pick=5, block_ttl_hours=1))
+        pool._clock = lambda: now[0]
+        pool.refresh()
+        self.assertEqual(pool.proxies, [])
+
+        probed = []
+        pool._block_probe = lambda e, p, t: (probed.append(e.ip) or {
+            "pandatv": BlockResult(False, "pandatv", "ok")})
+        now[0] += 2 * 3600      # 超过 1 小时有效期
+        pool.refresh()
+        self.assertIn("1.1.1.1", probed)
+        self.assertEqual([e.ip for e in pool.proxies], ["1.1.1.1"])
+
     def test_block_probe_disabled_keeps_proxy(self):
         settings = Ip2FreeSettings(
             enabled=True, email="a@b.c", password="p", max_pick=5, block_probes=()

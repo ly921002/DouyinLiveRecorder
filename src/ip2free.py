@@ -93,6 +93,7 @@ CONFIG_KEYS: dict[str, str] = {
     "pick_mode": "ip2free代理选择方式",
     "recheck_minutes": "ip2free代理复检间隔(分钟)",
     "block_probes": "ip2free平台封禁探测",
+    "block_ttl_hours": "ip2free封禁记录有效期(小时)",
 }
 
 #: config.ini 缺失这些项时的默认值（会被 main.read_config_value 自动补写进配置文件）
@@ -110,6 +111,7 @@ CONFIG_DEFAULTS: dict[str, str] = {
     "pick_mode": PICK_MODE_RANDOM,
     "recheck_minutes": "5",
     "block_probes": DEFAULT_BLOCK_PROBES,
+    "block_ttl_hours": "6",
 }
 
 _TRUE_VALUES = {"是", "yes", "y", "true", "1", "on", "enable", "enabled"}
@@ -212,6 +214,7 @@ class Ip2FreeSettings:
     pick_mode: str = PICK_MODE_RANDOM
     recheck_minutes: int = 5
     block_probes: tuple[str, ...] = (DEFAULT_BLOCK_PROBES,)
+    block_ttl_hours: int = 6
 
     @property
     def has_credentials(self) -> bool:
@@ -230,6 +233,7 @@ class Ip2FreeSettings:
             self.test_url,
             self.pick_mode,
             self.block_probes,
+            self.block_ttl_hours,
         )
 
     @classmethod
@@ -283,6 +287,7 @@ class Ip2FreeSettings:
             pick_mode=pick_mode,
             recheck_minutes=_to_int(raw("recheck_minutes"), 5, 1, 720),
             block_probes=_parse_block_probes(raw("block_probes")),
+            block_ttl_hours=_to_int(raw("block_ttl_hours"), 6, 1, 720),
         )
 
 
@@ -1001,22 +1006,52 @@ class Ip2FreeProxyPool:
 
     # ---------------- 刷新
 
+    def _drop_known_blocked(self, entries: Sequence[ProxyEntry], label: str = "") -> list[ProxyEntry]:
+        """剔除仍在封禁有效期内的代理，一次探测都不做。"""
+        platforms = self.settings.block_probes
+        if not platforms:
+            return list(entries)
+        kept: list[ProxyEntry] = []
+        skipped: list[str] = []
+        with self._lock:
+            for entry in entries:
+                record = self._blocked.get(entry.key) or {}
+                if record and self._block_record_valid(record, platforms):
+                    skipped.append(entry.key)
+                else:
+                    kept.append(entry)
+        if skipped:
+            logger.debug(
+                "ip2free 跳过 {0} 条封禁记录仍在有效期的代理（{1}）：{2}".format(
+                    len(skipped), label or "probe", "、".join(skipped)
+                )
+            )
+        return kept
+
     def _filter_blocked(self, entries: Sequence[ProxyEntry]) -> list[ProxyEntry]:
         """剔除被目标平台封禁的代理，并按需写日志。
 
         代理能出网不代表目标平台肯收（PandaTV 会按出口 IP 直接 403 block），
         这类代理必须和"连不上"一样被舍弃，否则会一直占用池子、反复录制失败。
+
+        已知被封禁的代理会**直接跳过、不再重复探测**，也不再重复打 WARNING，
+        避免每小时刷新都把同样的几条代理重新测一遍、刷一堆重复日志。
         """
         platforms = self.settings.block_probes
         if not platforms or not entries:
             return list(entries)
 
+        # 命中已知封禁名单的直接丢弃，省掉一次平台请求（超过有效期则重新探测）
+        fresh = self._drop_known_blocked(entries, "block-probe")
+        if not fresh:
+            return []
+
         probe_func = self._block_probe or probe_platform_blocks
-        workers = max(1, min(self.settings.max_workers, len(entries)))
+        workers = max(1, min(self.settings.max_workers, len(fresh)))
         kept: list[ProxyEntry] = []
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ip2free-block") as executor:
             futures = {executor.submit(probe_func, entry, platforms, self.settings.probe_timeout): entry
-                       for entry in entries}
+                       for entry in fresh}
             for future in as_completed(futures):
                 entry = futures[future]
                 try:
@@ -1032,13 +1067,17 @@ class Ip2FreeProxyPool:
                         self._blocked.pop(entry.key, None)
                     continue
                 with self._lock:
-                    self._blocked[entry.key] = blocked_here
+                    self._blocked[entry.key] = {
+                        "platforms": blocked_here,
+                        "blocked_at": self._clock(),
+                    }
                 logger.warning(
                     "ip2free 代理 {0} 被平台封禁（{1}），已舍弃并切换其他代理".format(
                         entry.key,
                         "、".join("{0}: {1}".format(p, d) for p, d in blocked_here.items()),
                     )
                 )
+        self._save_blocked()
 
         # 保持入参顺序，便于调用方观察
         order = {entry.key: index for index, entry in enumerate(entries)}
@@ -1048,10 +1087,93 @@ class Ip2FreeProxyPool:
     def blocked_info(self) -> dict[str, dict[str, str]]:
         """当前被判定的平台封禁记录（ip:port -> {平台: 说明}），供日志/状态展示。"""
         with self._lock:
-            return {key: dict(value) for key, value in self._blocked.items()}
+            return {
+                key: dict(record.get("platforms") or {})
+                for key, record in self._blocked.items()
+            }
+
+    def blocked_records(self) -> dict[str, dict[str, Any]]:
+        """完整的封禁记录（含 blocked_at 时间戳），供需要判定有效期的调用方使用。"""
+        with self._lock:
+            return {
+                key: {
+                    "platforms": dict(record.get("platforms") or {}),
+                    "blocked_at": float(record.get("blocked_at") or 0),
+                }
+                for key, record in self._blocked.items()
+            }
+
+    def _block_record_valid(self, record: dict, platforms: Sequence[str]) -> bool:
+        """封禁记录是否仍可复用：覆盖当前要探测的平台，且未超过有效期。"""
+        marked = record.get("platforms") or {}
+        if not any(platform in marked for platform in platforms):
+            return False
+        if self.settings.block_ttl_hours <= 0:
+            return True
+        blocked_at = float(record.get("blocked_at") or 0)
+        if blocked_at <= 0:
+            # 旧格式没有时间戳，按过期处理，让它重新验证一次
+            return False
+        return (self._clock() - blocked_at) < self.settings.block_ttl_hours * 3600
+
+    @property
+    def blocked_path(self) -> Path:
+        return self.state_dir / "blocked.json"
+
+    def _load_blocked(self) -> None:
+        """读取封禁名单：让重启后也不再复用已知被封禁的代理。"""
+        path = self.blocked_path
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        entries = payload.get("blocked") if isinstance(payload, dict) else None
+        if not isinstance(entries, dict):
+            return
+        cleaned: dict[str, dict[str, Any]] = {}
+        for key, value in entries.items():
+            if not isinstance(value, dict) or not value:
+                continue
+            # 兼容旧结构（直接是 {平台: 说明}）
+            if "platforms" in value or "blocked_at" in value:
+                platforms = value.get("platforms") or {}
+                cleaned[str(key)] = {
+                    "platforms": {str(k): str(v) for k, v in platforms.items()} if isinstance(platforms, dict) else {},
+                    "blocked_at": float(value.get("blocked_at") or 0),
+                }
+            else:
+                cleaned[str(key)] = {
+                    "platforms": {str(k): str(v) for k, v in value.items()},
+                    "blocked_at": 0.0,
+                }
+        with self._lock:
+            self._blocked = cleaned
+        if cleaned:
+            logger.debug("ip2free 载入封禁名单 {0} 条：{1}".format(len(cleaned), path))
+
+    def _save_blocked(self) -> None:
+        with self._lock:
+            payload = {
+                "updated_at": self._clock(),
+                "updated_text": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "blocked": {key: dict(value) for key, value in self._blocked.items()},
+            }
+        try:
+            self.blocked_path.parent.mkdir(parents=True, exist_ok=True)
+            self.blocked_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.debug("写入封禁名单失败：{0}".format(exc))
 
     def _probe_many(self, entries: Sequence[ProxyEntry], label: str) -> list[ProxyEntry]:
         """并发实测一组代理，返回仍可用（带实测延迟）的条目。"""
+        if not entries:
+            return []
+        # 已知被封禁的直接跳过，连测速都不做（避免每小时重复请求同几条死代理）
+        entries = self._drop_known_blocked(entries, label)
         if not entries:
             return []
         probe_func = self._probe or probe_proxy
@@ -1306,6 +1428,7 @@ class Ip2FreeProxyPool:
     def bootstrap(self) -> Optional[ProxyEntry]:
         """启动时调用：优先用未过期缓存，否则（或缓存为空时）刷新一次，然后随机挑一条。"""
         self._load_cache()
+        self._load_blocked()
         if self.proxies and not self.is_stale():
             logger.debug("ip2free 使用本地缓存代理池：{0} 条可用".format(len(self.proxies)))
         else:
