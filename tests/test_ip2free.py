@@ -417,9 +417,7 @@ class PoolTestCase(unittest.TestCase):
         pool._probe = lambda entry, url, timeout: ProbeResult(
             ok=entry.username == "olduser", latency_ms=25
         )
-        pool._candidates["1.1.1.1:1080"] = replace(
-            pool._candidates["1.1.1.1:1080"], probed_at=0.0   # 强制到期重测
-        )
+        self.now[0] += self.settings.recheck_minutes * 60 + 1   # 强制到期重测
         pool.refresh()
         self.assertEqual([e.username for e in pool.proxies], ["olduser"])
         self.assertEqual(pool.current.username, "olduser")
@@ -450,9 +448,7 @@ class PoolTestCase(unittest.TestCase):
 
         self.client.entries = [new]
         pool._probe = lambda entry, url, timeout: ProbeResult(ok=False)
-        pool._candidates["1.1.1.1:1080"] = replace(
-            pool._candidates["1.1.1.1:1080"], probed_at=0.0
-        )
+        self.now[0] += self.settings.recheck_minutes * 60 + 1
         self.assertEqual(pool.refresh(), [])
         self.assertEqual(pool.proxies, [])
         self.assertEqual(len(pool._candidates), 1)  # 保留候选，下轮复测
@@ -713,8 +709,12 @@ class BlockFilteringTestCase(unittest.TestCase):
             {"pandatv": BlockResult(True, "pandatv", "block")} if e.ip == "2.2.2.2"
             else {"pandatv": BlockResult(False, "pandatv", "ok")}
         )
-        for key in ("1.1.1.1:1080", "2.2.2.2:1080"):
-            pool._candidates[key] = replace(pool._candidates[key], probed_at=0.0)
+        # 把候选标记成「很久没测」，触发复检（该测试类使用固定时钟）
+        with pool._lock:
+            for key in list(pool._candidates):
+                pool._candidates[key] = replace(
+                    pool._candidates[key], probed_at=-10_000.0
+                )
         pool.recheck()
         self.assertEqual([e.ip for e in pool.proxies], ["1.1.1.1"])
         self.assertIn("2.2.2.2:1080", pool.retired_info())

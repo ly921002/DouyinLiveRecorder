@@ -108,7 +108,7 @@ CONFIG_DEFAULTS: dict[str, str] = {
     "refresh_minutes": "60",
     "test_url": DEFAULT_TEST_URL,
     "pick_mode": PICK_MODE_RANDOM,
-    "recheck_minutes": "5",
+    "recheck_minutes": "30",
     "block_probes": DEFAULT_BLOCK_PROBES,
 }
 
@@ -217,7 +217,7 @@ class Ip2FreeSettings:
     test_url: str = DEFAULT_TEST_URL
     page_size: int = 50
     pick_mode: str = PICK_MODE_RANDOM
-    recheck_minutes: int = 5
+    recheck_minutes: int = 30
     block_probes: tuple[str, ...] = (DEFAULT_BLOCK_PROBES,)
 
     @property
@@ -288,7 +288,7 @@ class Ip2FreeSettings:
             refresh_minutes=_to_int(raw("refresh_minutes"), 60, 1, 1440),
             test_url=raw("test_url") or DEFAULT_TEST_URL,
             pick_mode=pick_mode,
-            recheck_minutes=_to_int(raw("recheck_minutes"), 5, 1, 720),
+            recheck_minutes=_to_int(raw("recheck_minutes"), 30, 1, 720),
             block_probes=_parse_block_probes(raw("block_probes")),
         )
 
@@ -1194,7 +1194,13 @@ class Ip2FreeProxyPool:
         return added, kept_old_cred
 
     def _candidates_due(self, force: bool = False) -> list[ProxyEntry]:
-        """挑出需要测速的候选：未测过的、上次不通的、或已过复检间隔的。"""
+        """挑出需要测速的候选。
+
+        * 从没测过的（``healthy is None``）：立刻测，才知道它能不能用；
+        * 测过的（无论通不通）：都要等 ``ip2free代理复检间隔`` 到期后再测。
+          曾经不通的代理不能每轮都重测——否则每分钟都在打同一批废代理，
+          既浪费请求又刷日志；它们只需按复检间隔轮询即可。
+        """
         now = self._clock()
         interval = self.settings.recheck_minutes * 60
         with self._lock:
@@ -1204,7 +1210,7 @@ class Ip2FreeProxyPool:
         for entry in pool:
             if entry.key in retired:
                 continue
-            if force or entry.healthy is not True:
+            if force or entry.healthy is None:
                 due.append(entry)
             elif (now - entry.probed_at) >= interval:
                 due.append(entry)

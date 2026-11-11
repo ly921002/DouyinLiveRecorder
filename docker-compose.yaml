@@ -42,6 +42,10 @@ services:
       - ./logs:/app/logs
       - ./backup_config:/app/backup_config
       - ./downloads:/app/downloads
+      # ip2free 代理池状态：候选池、淘汰名单（platform 封禁）、登录 token、proxychains 导出。
+      # 不挂载的话容器重建就丢，重启后需要重新发现哪些代理被封禁、重新测速全部候选。
+      # 宿主机目录会自动创建；若宿主机上还没有该目录，先 mkdir -p .ip2free 再 up 亦可。
+      - ./.ip2free:/app/.ip2free
       # 需要覆盖代理配置时才启用这一行。
       # 注意：宿主机上的 ./proxychains.conf 必须是「已存在的文件」，
       # 不能是目录——Compose 会为不存在的挂载源自动创建目录，

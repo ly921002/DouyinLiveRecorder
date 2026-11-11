@@ -631,7 +631,7 @@ CONFIG_FIELD_SCHEMA: tuple[dict[str, Any], ...] = (
     _field("ip2free代理刷新间隔(分钟)", "ip2free 代理刷新间隔(分钟)", "integer",
            "到期后在后台重新抓取并测速，不阻塞录制", 60, None, 1, 1440),
     _field("ip2free代理复检间隔(分钟)", "ip2free 代理复检间隔(分钟)", "integer",
-           "到期后复检池内代理是否仍可用，失效的会被剔除", 5, None, 1, 720),
+           "到期后复测候选池里还没通/待复检的代理；实测一轮约 3 秒", 30, None, 1, 720),
     _field("ip2free测速地址", "ip2free 测速地址", "string",
            "经代理访问的连通性测试地址，返回码小于 500 即视为可用",
            "https://www.gstatic.com/generate_204"),
